@@ -1,30 +1,40 @@
 # report_generator.py
 # -*- coding: utf-8 -*-
 """
-o4-mini を使ってフットサルの試合レポートを生成するモジュール（テキストのみ版）。
+o4-mini を使ってフットサルの試合レポートを生成するモジュール。
 
 - Swift 側の LLMPayload（matchId, home/away, events など）に対応する dict を受け取り、
   それをもとに日本語の試合レポートを生成する。
-- まずは安定動作を優先して、画像（snapshotPath）は一切使わず、
-  試合記録のテキスト情報だけでレポートを生成する。
+- events[].snapshotPath には、FastAPI から配信している画像の「相対パス」または
+  「フルURL」が入っている想定。
+  （例）"snapshots/xxxx.png" または "https://futsal-report-api.onrender.com/snapshots/xxxx.png"
+- FastAPI 側 (main.py) から generate_match_report() を呼び出して使う前提。
 """
 
-import json
+import os
 from typing import Dict, Any, List
 from openai import OpenAI
 
 client = OpenAI()
 
+# 画像URLを組み立てるときのベースURL
+# 例: https://futsal-report-api.onrender.com
+SNAPSHOT_BASE_URL = os.getenv(
+    "SNAPSHOT_BASE_URL",
+    "https://futsal-report-api.onrender.com"
+)
+
 # ===== プロンプト =====
 
 SYSTEM_PROMPT = """\
 あなたはフットサルの試合レポートを書くスポーツライターです。
-与えられた試合記録（テキスト情報）をもとに、
+与えられた試合記録（テキスト情報と戦術ボード画像）をもとに、
 日本語で読みやすい試合レポートを書いてください。
 
 - 試合の概要（大会名・カテゴリ・対戦カード・会場など）を最初に一文でまとめる
 - スコアとゴールの時間・得点者を時系列で整理する
 - 前半・後半それぞれでどのような流れだったかを描写する
+- 画像から分かる「配置」「マークの付き方」「数的優位/劣位」「狙い」なども言及する
 - ハイライトシーンを2〜3個ピックアップして、状況や流れの変化が分かるように書く
 - 最後に「この試合の収穫と今後の課題」を短くまとめる
 - だいたい 600〜1000文字程度
@@ -88,12 +98,26 @@ def _build_event_text(ev: Dict[str, Any]) -> str:
     return f"[{time_str}] {side_str} の {ev_type}。{players_str}{note_str}".strip()
 
 
+def _build_image_url(snapshot_path: str) -> str:
+    """
+    snapshotPath からフルの画像URLを作る。
+    - すでに http(s) で始まっていたらそのまま使う
+    - そうでなければ SNAPSHOT_BASE_URL と結合してフルURLにする
+    """
+    if snapshot_path.startswith("http://") or snapshot_path.startswith("https://"):
+        return snapshot_path
 
-def build_text_only_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # 相対パスの場合: ベースURL + / + パス で連結
+    base = SNAPSHOT_BASE_URL.rstrip("/")
+    path = snapshot_path.lstrip("/")
+    return f"{base}/{path}"
+
+
+def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Responses API に渡す input（system + user）を構築する。
     - system: SYSTEM_PROMPT（input_text）
-    - user: 試合概要テキスト + 各イベントのテキスト（画像は使わない）
+    - user: 試合概要テキスト + 各イベントのテキスト & 戦術ボード画像
     """
     # --- 試合の概要 ---
     venue = match_payload.get("venue") or "会場不明"
@@ -116,23 +140,44 @@ def build_text_only_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]]
 
     events = match_payload.get("events", [])
 
-    # --- user.content を組み立てる（テキストのみ） ---
-    lines: List[str] = []
+    # --- user.content を組み立てる（テキスト + 画像） ---
+    user_content: List[Dict[str, Any]] = []
 
-    lines.append("以下はフットサルの試合記録です。")
-    lines.append("この情報をもとに、systemメッセージの指示に従い、詳細な試合レポートを書いてください。")
-    lines.append("")
-    lines.append("【試合概要】")
-    lines.append(header_text.strip())
-    lines.append("")
-    lines.append("【イベント一覧】")
+    # 冒頭の説明
+    intro_text = (
+        "以下にフットサルの試合記録と、各イベントに対応する戦術ボード画像を与えます。\n"
+        "テキスト情報（時間・チーム・選手番号・メモなど）と画像の両方を踏まえて、"
+        "systemメッセージの指示に従い、詳細な試合レポートを書いてください。\n\n"
+        "【試合概要】\n"
+        f"{header_text}\n"
+        "【イベント一覧】\n"
+        "それぞれのイベントには、可能であれば直後に対応する戦術ボード画像が続きます。\n"
+    )
 
+    user_content.append({
+        "type": "input_text",
+        "text": intro_text,
+    })
+
+    # 各イベント + 画像
     for idx, ev in enumerate(events, start=1):
         ev_text = _build_event_text(ev)
-        lines.append(f"\n--- イベント {idx} ---")
-        lines.append(ev_text)
+        ev_header = f"\n--- イベント {idx} ---\n"
 
-    full_text = "\n".join(lines)
+        # テキスト部分
+        user_content.append({
+            "type": "input_text",
+            "text": ev_header + ev_text,
+        })
+
+        # 画像があれば image_url を付ける
+        snapshot_path = ev.get("snapshotPath")
+        if snapshot_path:
+            image_url = _build_image_url(snapshot_path)
+            user_content.append({
+                "type": "input_image",
+                "image_url": image_url,
+            })
 
     messages = [
         {
@@ -143,9 +188,7 @@ def build_text_only_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]]
         },
         {
             "role": "user",
-            "content": [
-                {"type": "input_text", "text": full_text},
-            ],
+            "content": user_content,
         },
     ]
     return messages
@@ -166,10 +209,10 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
     str
         o4-mini が生成した試合レポート（日本語テキスト）。
     """
-    messages = build_text_only_input(match_payload)
+    messages = build_multimodal_input(match_payload)
 
     response = client.responses.create(
-        model="o4-mini",  # ← ここを有効なモデル名に
+        model="o4-mini",
         input=messages,
     )
 

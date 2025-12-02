@@ -2,16 +2,22 @@
 # -*- coding: utf-8 -*-
 
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pathlib import Path
+import os
 import logging
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
 from report_generator import generate_match_report
 
 # ログ設定
-logging.basicConfig(level=logging.DEBUG,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-# ロガーのインスタンスを作成
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 # ==== Swift側の LLMPayload に対応する Pydantic モデル ====
@@ -59,19 +65,69 @@ class ReportResponse(BaseModel):
 
 app = FastAPI()
 
+# スナップショット保存ディレクトリ
+SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "snapshots"))
+SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# /snapshots/ 配下を静的ファイルとして公開
+app.mount(
+    "/snapshots",
+    StaticFiles(directory=SNAPSHOT_DIR),
+    name="snapshots",
+)
+
+
+# ========== 画像アップロード用エンドポイント ==========
+
+@app.post("/upload_snapshot")
+async def upload_snapshot(
+    matchId: str = Form(...),
+    eventId: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """
+    iOS から送られてきた戦術ボード画像を保存し、
+    クライアントが使う snapshotPath（相対パス）を返す。
+    """
+    logger.debug(f"upload_snapshot: matchId={matchId}, eventId={eventId}, filename={file.filename}")
+
+    # 保存先ディレクトリ: snapshots/<matchId>/
+    match_dir = SNAPSHOT_DIR / matchId
+    match_dir.mkdir(parents=True, exist_ok=True)
+
+    # 拡張子は一旦 .png に固定（必要なら file.filename から推定してもOK）
+    filename = f"{eventId}.png"
+    save_path = match_dir / filename
+
+    content = await file.read()
+    save_path.write_bytes(content)
+
+    # クライアントに返す snapshotPath（LLMPayload.events[].snapshotPath に入れる）
+    snapshot_path = f"/snapshots/{matchId}/{filename}"
+    logger.debug(f"saved snapshot to {save_path}, snapshotPath={snapshot_path}")
+
+    return JSONResponse({"snapshotPath": snapshot_path})
+
+
+# ========== 試合レポート生成エンドポイント ==========
+
 @app.post("/generate_report", response_model=ReportResponse)
-def generate_report(payload: LLMPayload):
+async def generate_report_endpoint(payload: LLMPayload):
     """
-    iOS アプリから LLMPayload を受け取り、
-    o4-mini で試合レポートを生成して返すエンドポイント。
+    iOS から LLMPayload（試合記録＋イベント情報）が送られてくる想定。
+    report_generator.generate_match_report() を呼び出して、
+    日本語の試合レポートを返す。
     """
+    logger.debug("generate_report called")
     try:
-        logger.debug(f"Received payload: {payload}")  # ログで受け取ったデータを表示
-        payload_dict = payload.dict()  # Pydanticモデル → dict に変換してそのまま渡す
-        report = generate_match_report(payload_dict)  # レポート生成関数の呼び出し
-        logger.info("レポート生成完了")  # 成功時のログ
+        # Pydantic モデル → dict に変換して LLM へ
+        match_dict = payload.model_dump()
+        report = generate_match_report(match_dict)
+        logger.debug("report generated successfully")
         return ReportResponse(report=report)
-    
     except Exception as e:
-        logger.error(f"エラーが発生しました: {e}")  # エラーが発生した場合
-        raise HTTPException(status_code=500, detail="レポート生成中にエラーが発生しました")
+        logger.exception("エラーが発生しました: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail="レポート生成中にエラーが発生しました",
+        )
