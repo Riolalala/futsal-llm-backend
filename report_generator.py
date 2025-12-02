@@ -5,20 +5,21 @@ o4-mini を使ってフットサルの試合レポートを生成するモジュ
 
 - Swift 側の LLMPayload（matchId, home/away, events など）に対応する dict を受け取り、
   それをもとに日本語の試合レポートを生成する。
-- events[].snapshotPath には、FastAPI 側の /upload_snapshot が返した
-  「/snapshots/xxxx/m7f8e9....png」形式の相対パスが入っている前提。
+- events[].snapshotPath には、FastAPI の /upload_snapshot から返された
+  「/snapshots/<matchId>/<eventId>.png」のような相対パスが入る想定。
 """
 
+import json
 import os
 from typing import Dict, Any, List
 from openai import OpenAI
 
 client = OpenAI()
 
-# 画像URLのベース（Render の本番URLをデフォルトに）
+# 画像URLのベース（Render 本番のURL）。環境変数で上書きも可
 SNAPSHOT_BASE_URL = os.getenv(
     "SNAPSHOT_BASE_URL",
-    "https://futsal-report-api.onrender.com"  # ← Render の URL
+    "https://futsal-report-api.onrender.com",
 )
 
 # ===== プロンプト =====
@@ -39,7 +40,10 @@ SYSTEM_PROMPT = """\
 
 
 def _build_event_text(ev: Dict[str, Any]) -> str:
-    """1イベントぶんを人間向けテキストに整形する。"""
+    """
+    1イベントぶんを人間向けテキストに整形する。
+    （半分・時間・チーム・選手番号・メモなど）
+    """
     half = ev.get("half") or ""
     minute_raw = ev.get("minute")
     second_raw = ev.get("second")
@@ -91,22 +95,11 @@ def _build_event_text(ev: Dict[str, Any]) -> str:
     return f"[{time_str}] {side_str} の {ev_type}。{players_str}{note_str}".strip()
 
 
-def _to_full_image_url(snapshot_path: str) -> str:
-    """
-    /snapshots/... 形式の相対パスから、OpenAI に渡せるフルURLを作る。
-    """
-    base = SNAPSHOT_BASE_URL.rstrip("/")
-    if snapshot_path.startswith("/"):
-        return base + snapshot_path
-    else:
-        return base + "/" + snapshot_path
-
-
 def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Responses API に渡す input（system + user）を構築する。
     - system: SYSTEM_PROMPT（input_text）
-    - user: 試合概要テキスト + 各イベントのテキスト & 画像
+    - user: 試合概要テキスト + 各イベントのテキスト & 画像（snapshotPath があれば input_image）
     """
     # --- 試合の概要 ---
     venue = match_payload.get("venue") or "会場不明"
@@ -129,10 +122,9 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
 
     events = match_payload.get("events", [])
 
-    # --- user.content を組み立てる（input_text + input_image の配列） ---
+    # --- user.content を組み立てる（テキスト＋画像） ---
     user_content: List[Dict[str, Any]] = []
 
-    # 試合全体の説明
     intro_text = (
         "以下にフットサルの試合記録と、各イベントに対応する戦術ボード画像を与えます。\n"
         "テキスト情報（時間・チーム・選手番号・メモなど）と画像の両方を踏まえて、"
@@ -148,8 +140,8 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
         "text": intro_text,
     })
 
-    # 各イベント
     for idx, ev in enumerate(events, start=1):
+        # まずテキスト
         ev_text = _build_event_text(ev)
         ev_header = f"\n--- イベント {idx} ---\n"
         user_content.append({
@@ -157,14 +149,30 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
             "text": ev_header + ev_text,
         })
 
+        # 次に画像（あれば）
         snapshot_path = ev.get("snapshotPath")
-        if snapshot_path:
-            image_url = _to_full_image_url(snapshot_path)
-            user_content.append({
-                "type": "input_image",
-                "image_url": image_url,
-                # "detail": "high",  # 必要なら有効化
-            })
+
+        if not snapshot_path:
+            continue
+
+        # 🔴 ここでフィルタリング：変な値("string" など)は無視
+        if snapshot_path == "string" or snapshot_path == "string.":
+            continue
+
+        # フルURLの組み立て
+        if snapshot_path.startswith("http://") or snapshot_path.startswith("https://"):
+            image_url = snapshot_path
+        elif snapshot_path.startswith("/"):
+            # 例: "/snapshots/<matchId>/<eventId>.png"
+            image_url = SNAPSHOT_BASE_URL.rstrip("/") + snapshot_path
+        else:
+            # "snapshots/..." のようにスラッシュなしで来た場合もケア
+            image_url = SNAPSHOT_BASE_URL.rstrip("/") + "/" + snapshot_path
+
+        user_content.append({
+            "type": "input_image",
+            "image_url": image_url,
+        })
 
     messages = [
         {
@@ -188,7 +196,7 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
     messages = build_multimodal_input(match_payload)
 
     response = client.responses.create(
-        model="o4-mini",   # マルチモーダル対応モデル
+        model="o4-mini",
         input=messages,
     )
 
