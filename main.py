@@ -89,7 +89,10 @@ async def upload_snapshot(
     iOS から送られてきた戦術ボード画像を保存し、
     クライアントが使う snapshotPath（相対パス）を返す。
     """
-    logger.debug(f"upload_snapshot: matchId={matchId}, eventId={eventId}, filename={file.filename}")
+    logger.debug(
+        "upload_snapshot: matchId=%s, eventId=%s, filename=%s",
+        matchId, eventId, file.filename,
+    )
 
     # 保存先ディレクトリ: snapshots/<matchId>/
     match_dir = SNAPSHOT_DIR / matchId
@@ -104,7 +107,7 @@ async def upload_snapshot(
 
     # クライアントに返す snapshotPath（LLMPayload.events[].snapshotPath に入れる）
     snapshot_path = f"/snapshots/{matchId}/{filename}"
-    logger.debug(f"saved snapshot to {save_path}, snapshotPath={snapshot_path}")
+    logger.debug("saved snapshot to %s, snapshotPath=%s", save_path, snapshot_path)
 
     return JSONResponse({"snapshotPath": snapshot_path})
 
@@ -112,13 +115,16 @@ async def upload_snapshot(
 # ========== 試合レポート生成エンドポイント ==========
 
 @app.post("/generate_report", response_model=ReportResponse)
-async def generate_report_endpoint(payload: LLMPayload):
+async def generate_report_endpoint(payload: LLMPayload) -> ReportResponse:
     """
     iOS から LLMPayload（試合記録＋イベント情報）が送られてくる想定。
     report_generator.generate_match_report() を呼び出して、
     日本語の試合レポートを返す。
     """
-    logger.debug("generate_report called")
+    logger.info(
+        "generate_report called: matchId=%s, events=%d",
+        payload.matchId, len(payload.events),
+    )
     try:
         # Pydantic モデル → dict に変換して LLM へ
         match_dict = payload.model_dump()
@@ -126,7 +132,7 @@ async def generate_report_endpoint(payload: LLMPayload):
         logger.debug("report generated successfully")
         return ReportResponse(report=report)
     except Exception as e:
-        logger.exception("エラーが発生しました: %s", e)
+        logger.exception("レポート生成中に例外が発生しました: %s", e)
         raise HTTPException(
             status_code=500,
             detail="レポート生成中にエラーが発生しました",
