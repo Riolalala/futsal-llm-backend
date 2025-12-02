@@ -1,14 +1,12 @@
 # report_generator.py
 # -*- coding: utf-8 -*-
 """
-o4-mini を使ってフットサルの試合レポートを生成するモジュール。
+o4-mini を使ってフットサルの試合レポートを生成するモジュール（テキスト＋画像版）。
 
 - Swift 側の LLMPayload（matchId, home/away, events など）に対応する dict を受け取り、
   それをもとに日本語の試合レポートを生成する。
-- events[].snapshotPath には、FastAPI から配信している画像の「相対パス」または
-  「フルURL」が入っている想定。
-  （例）"snapshots/xxxx.png" または "https://futsal-report-api.onrender.com/snapshots/xxxx.png"
-- FastAPI 側 (main.py) から generate_match_report() を呼び出して使う前提。
+- events[].snapshotPath には、FastAPI 側の /upload_snapshot が返した
+  「/snapshots/xxxx/m7f8e9....png」形式の相対パスが入っている前提。
 """
 
 import os
@@ -17,18 +15,17 @@ from openai import OpenAI
 
 client = OpenAI()
 
-# 画像URLを組み立てるときのベースURL
-# 例: https://futsal-report-api.onrender.com
+# 画像URLのベース（Render の本番URLをデフォルトに）
 SNAPSHOT_BASE_URL = os.getenv(
     "SNAPSHOT_BASE_URL",
-    "https://futsal-report-api.onrender.com"
+    "https://futsal-report-api.onrender.com"  # ← Render の URL
 )
 
 # ===== プロンプト =====
 
 SYSTEM_PROMPT = """\
 あなたはフットサルの試合レポートを書くスポーツライターです。
-与えられた試合記録（テキスト情報と戦術ボード画像）をもとに、
+与えられた試合記録（テキスト情報）と戦術ボード画像をもとに、
 日本語で読みやすい試合レポートを書いてください。
 
 - 試合の概要（大会名・カテゴリ・対戦カード・会場など）を最初に一文でまとめる
@@ -42,10 +39,7 @@ SYSTEM_PROMPT = """\
 
 
 def _build_event_text(ev: Dict[str, Any]) -> str:
-    """
-    1イベントぶんを人間向けテキストに整形する。
-    （半分・時間・チーム・選手番号・メモなど）
-    """
+    """1イベントぶんを人間向けテキストに整形する。"""
     half = ev.get("half") or ""
     minute_raw = ev.get("minute")
     second_raw = ev.get("second")
@@ -64,7 +58,6 @@ def _build_event_text(ev: Dict[str, Any]) -> str:
         if second_raw is not None:
             second = int(second_raw)
     except (TypeError, ValueError):
-        # 変な値が来たらあきらめて「時間不明」に落とす
         minute = None
         second = None
 
@@ -98,26 +91,22 @@ def _build_event_text(ev: Dict[str, Any]) -> str:
     return f"[{time_str}] {side_str} の {ev_type}。{players_str}{note_str}".strip()
 
 
-def _build_image_url(snapshot_path: str) -> str:
+def _to_full_image_url(snapshot_path: str) -> str:
     """
-    snapshotPath からフルの画像URLを作る。
-    - すでに http(s) で始まっていたらそのまま使う
-    - そうでなければ SNAPSHOT_BASE_URL と結合してフルURLにする
+    /snapshots/... 形式の相対パスから、OpenAI に渡せるフルURLを作る。
     """
-    if snapshot_path.startswith("http://") or snapshot_path.startswith("https://"):
-        return snapshot_path
-
-    # 相対パスの場合: ベースURL + / + パス で連結
     base = SNAPSHOT_BASE_URL.rstrip("/")
-    path = snapshot_path.lstrip("/")
-    return f"{base}/{path}"
+    if snapshot_path.startswith("/"):
+        return base + snapshot_path
+    else:
+        return base + "/" + snapshot_path
 
 
 def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Responses API に渡す input（system + user）を構築する。
     - system: SYSTEM_PROMPT（input_text）
-    - user: 試合概要テキスト + 各イベントのテキスト & 戦術ボード画像
+    - user: 試合概要テキスト + 各イベントのテキスト & 画像
     """
     # --- 試合の概要 ---
     venue = match_payload.get("venue") or "会場不明"
@@ -140,10 +129,10 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
 
     events = match_payload.get("events", [])
 
-    # --- user.content を組み立てる（テキスト + 画像） ---
+    # --- user.content を組み立てる（input_text + input_image の配列） ---
     user_content: List[Dict[str, Any]] = []
 
-    # 冒頭の説明
+    # 試合全体の説明
     intro_text = (
         "以下にフットサルの試合記録と、各イベントに対応する戦術ボード画像を与えます。\n"
         "テキスト情報（時間・チーム・選手番号・メモなど）と画像の両方を踏まえて、"
@@ -159,24 +148,22 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
         "text": intro_text,
     })
 
-    # 各イベント + 画像
+    # 各イベント
     for idx, ev in enumerate(events, start=1):
         ev_text = _build_event_text(ev)
         ev_header = f"\n--- イベント {idx} ---\n"
-
-        # テキスト部分
         user_content.append({
             "type": "input_text",
             "text": ev_header + ev_text,
         })
 
-        # 画像があれば image_url を付ける
         snapshot_path = ev.get("snapshotPath")
         if snapshot_path:
-            image_url = _build_image_url(snapshot_path)
+            image_url = _to_full_image_url(snapshot_path)
             user_content.append({
                 "type": "input_image",
                 "image_url": image_url,
+                # "detail": "high",  # 必要なら有効化
             })
 
     messages = [
@@ -197,22 +184,11 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
 def generate_match_report(match_payload: Dict[str, Any]) -> str:
     """
     FastAPI から呼び出される想定の関数。
-
-    Parameters
-    ----------
-    match_payload : dict
-        Swift 側で組み立てられた LLMPayload を Pydantic の model_dump()
-        などで dict にしたもの。
-
-    Returns
-    -------
-    str
-        o4-mini が生成した試合レポート（日本語テキスト）。
     """
     messages = build_multimodal_input(match_payload)
 
     response = client.responses.create(
-        model="o4-mini",
+        model="o4-mini",   # マルチモーダル対応モデル
         input=messages,
     )
 
