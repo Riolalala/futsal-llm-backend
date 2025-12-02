@@ -114,26 +114,33 @@ async def upload_snapshot(
 
 # ========== 試合レポート生成エンドポイント ==========
 
+# ========== 試合レポート生成エンドポイント ==========
+
 @app.post("/generate_report", response_model=ReportResponse)
-async def generate_report_endpoint(payload: LLMPayload) -> ReportResponse:
+async def generate_report_endpoint(payload: LLMPayload):
     """
     iOS から LLMPayload（試合記録＋イベント情報）が送られてくる想定。
     report_generator.generate_match_report() を呼び出して、
     日本語の試合レポートを返す。
     """
-    logger.info(
-        "generate_report called: matchId=%s, events=%d",
-        payload.matchId, len(payload.events),
-    )
+    logger.debug("generate_report called")
     try:
         # Pydantic モデル → dict に変換して LLM へ
         match_dict = payload.model_dump()
+        logger.debug("payload (dict) = %s", match_dict)
+
         report = generate_match_report(match_dict)
-        logger.debug("report generated successfully")
+
+        logger.debug("report generated successfully, length=%d", len(report))
         return ReportResponse(report=report)
+
     except Exception as e:
-        logger.exception("レポート生成中に例外が発生しました: %s", e)
+        # ★ ここでサーバ側ログにフルのトレースバックを出す
+        logger.exception("エラーが発生しました: %s", e)
+
+        # ★ そしてクライアント側にもエラー内容をそのまま返す（デバッグ用）
         raise HTTPException(
             status_code=500,
-            detail="レポート生成中にエラーが発生しました",
+            detail=f"レポート生成中にエラーが発生しました: {repr(e)}",
         )
+
