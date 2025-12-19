@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 openai>=1.40.0
 numpy>=1.26.0
+python-multipart
