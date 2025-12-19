@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import os
-import re
 import json
+import re
 import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -11,64 +11,34 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 from openai import OpenAI
 
+# =========================
+# Settings (env)
+# =========================
+SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", "https://futsal-report-api.onrender.com")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "o4-mini")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
+
 client = OpenAI()
 
 # =========================
-# Logging
+# Logging (Render logs に確実に出す)
 # =========================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-)
 logger = logging.getLogger("report_generator")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 # =========================
-# Snapshot base url
+# Knowledge Base (ID付き)
 # =========================
-SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", "https://futsal-report-api.onrender.com").rstrip("/")
-
-# =========================
-# Config / Prompt
-# =========================
-def load_prompt() -> str:
-    """
-    config.json を読み込む。
-    Render では CWD がズレることがあるので __file__ 基準にする。
-    """
-    config_path = Path(__file__).resolve().parent / "config.json"
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        prompt = config.get("system_prompt", "")
-        logger.info("[BOOT] Loaded config.json: %s (len=%d)", str(config_path), len(prompt))
-        return prompt
-    except Exception as e:
-        logger.exception("[BOOT] Failed to load config.json: %s", e)
-        return ""
-
-SYSTEM_PROMPT_RAW = load_prompt()
-
-# config.json に {futsal_knowledge} が残ってても破綻しないように置換
-SYSTEM_PROMPT = (SYSTEM_PROMPT_RAW or "").replace(
-    "{futsal_knowledge}",
-    "（関連知識はRAGで必要分だけ提示されます）"
-)
-
-# “後半が無いなら書くな”を確実に効かせるため、system に追記（保険）
-SYSTEM_PROMPT += (
-    "\n\n【重要】\n"
-    "- 与えられていないイベント（特に後半）について推測・創作しない。\n"
-    "- 後半イベントが0件の場合は、後半の描写をせず『後半の記録は未提供』の一文だけにする。\n"
-    "- 与えられたイベントに書かれていない得点・失点・時間・選手名は捏造しない。\n"
-    "- RAGで提示された知識を使った場合は、該当文末に [KBxxx] を付ける（例: [KB011]）。\n"
-)
-
-# =========================
-# Knowledge Base (KB)
-# =========================
-# ※ここはあなたの futsal_knowledge をそのまま流用
-KB_TEXTS: List[str] = [
+_KB_TEXTS: List[str] = [
+    # 基本ルール
     "フットサルは通常、2×20分のハーフで行われ、インターバルは10分である。",
     "フットサルでは、サッカーと異なり、オフサイドがない。",
     "フットサルのコートはサッカーよりも小さく、サイドラインが短い。",
@@ -76,224 +46,274 @@ KB_TEXTS: List[str] = [
     "フットサルで使われるボールはサッカーよりも小さく、重さが異なる。",
     "フットサルの試合でファウルが累積され、5回を超えると相手チームにフリーキックが与えられる。",
 
-    "4-0フォーメーション（クワトロ）は、守備を重視した戦術で…",
-    "3-1フォーメーション（低め）は、3人が守備、1人（ピヴォ）が攻撃起点…",
-    "2-2フォーメーション（ボックス型）は、2人守備＋2人攻撃で…",
-    "1-3フォーメーション（高め）は、前線で攻撃を強化する…",
+    # 戦術用語（※文章は長くてもOK）
+    "4-0フォーメーション（クワトロ）は、4人がフラットに広がりパス回しで崩す攻撃的配置。相手の守備を横に揺さぶり、アイソレーションを作りやすい。",
+    "3-1フォーメーション（低め）は、3人が後方で安定し、1人（ピヴォ）を起点に前線で収める。守備は安定しやすく、攻撃はピヴォ当てから展開する。",
+    "2-2フォーメーション（ボックス型）は、2人守備＋2人攻撃の近い距離で連動しやすい。縦関係が作りやすく、中央を使った崩しやカウンターにも移りやすい。",
+    "1-3フォーメーション（高め）は、前線でプレッシャーをかけやすく攻撃枚数を確保しやすいが、背後のリスク管理が重要。",
 
     "守備戦術にはゾーンディフェンス、マンツーマンディフェンス、ハイプレスなどがある。",
     "攻撃戦術にはポゼッション重視、カウンターアタック、ウィング攻撃、セットプレイがある。",
     "カウンターアタックは、相手の攻撃から素早く攻撃に転じる戦術で、速いプレイが求められる。",
-    "ポゼッションプレイはボール保持を重視し、パス回しで相手を引きつけてスペースを作る。",
+    "ポゼッションプレイはボール保持を重視し、選手同士のパス回しで相手を引きつけてスペースを作り出す。",
 
-    "カットインは、サイドから中央に切れ込んで攻撃を仕掛ける動き。",
-    "キックインは、サイドラインを割った際に足で再開するプレイ。",
-    "スクリーンは、攻撃側が守備者をブロックしてパスコースを作る。",
-    "チョンドンは、キックインからの短いパス→シュートを狙う戦術。",
-    "デスマルケは、マークを外してスペースを作る動き。",
-    "パワープレーは、GKをフィールドに上げて数的優位で攻撃する。",
-    "ハーフは、自陣にコンパクトに構えて守る戦術。",
+    # 特定プレー
+    "カットインは、サイド攻撃選手がサイドラインから中央に切れ込んで攻撃を仕掛ける動き。",
+    "キックインは、ボールがサイドラインを越えた場合に、足を使ってボールを再投入するプレイ。",
+    "スクリーンは、攻撃側選手がディフェンダーを遮るように体でブロックし、味方のフリーを作る。",
+    "チョンドン（キックインからの短いパスでシュートを試みる）は、速攻を意識したキックイン戦術。",
+    "デスマルケは、マークを外して受け直し、パスコースやシュートコースを作る動き。",
+    "パワープレーは、GKをフィールドプレイヤー化して数的優位を作る戦術。",
+    "ハーフは、自陣の半分で守備を固め、コンパクトにラインを保つ戦術。",
 
-    "アイソレーション（孤立）は、攻撃側が1対1を作って仕掛ける。",
-    "ディフェンシブサードはゴールに近い守備エリア。",
-    "ミドルサードは中央の攻守バランスエリア。",
-    "アタッキングサードはゴールに近い攻撃エリア。",
+    # エリア用語
+    "アイソレーション（孤立）は、1対1を作って個で崩す状況づくり。",
+    "ディフェンシブサードはゴールに近い守備的エリア。",
+    "ミドルサードは中央の攻守バランスが重要なエリア。",
+    "アタッキングサードはゴールに近い攻撃的エリア。",
 
-    "ピヴォは攻撃の中心で、ボールを収めて起点になる。",
-    "アラはサイド担当で攻撃を展開する。",
-    "フィクソは守備の中心でライン統率を行う。",
-    "ゴールキーパーは守備だけでなく攻撃の起点にもなる。",
+    # ポジション
+    "ピヴォは攻撃の中心となる選手で、前線で収めて起点になる。",
+    "アラはサイドを担当して攻撃を展開する。",
+    "フィクソは守備の中心で、ビルドアップにも関与する。",
+    "ゴールキーパーは守備だけでなく、ビルドアップの起点としても重要。",
 
-    "ゾーンディフェンスはエリアを守る。",
-    "マンツーマンディフェンスは人に付く。",
-    "ハイプレスは高い位置から圧力をかける。",
-
-    "フリーキックやコーナーのセットプレイでは、ショートやダイレクトを使い分ける。",
-    "ゴールキック等の再開から素早く前進するのも重要。",
+    # セットプレイ
+    "フリーキックやコーナーのセットプレイでは、ショートやダイレクトを使い分けて守備のズレを作る。",
+    "ゴールキック等では安全な前進（保持）と、一気の前進（裏）を状況で選ぶ。",
 ]
 
-KB_ENTRIES: List[Dict[str, str]] = [
-    {"id": f"KB{idx+1:03d}", "text": t} for idx, t in enumerate(KB_TEXTS)
-]
+KB: List[Dict[str, str]] = []
+for i, t in enumerate(_KB_TEXTS, start=1):
+    KB.append({"id": f"KB{i:03d}", "text": t})
 
-KB_EMBED_MODEL = os.getenv("KB_EMBED_MODEL", "text-embedding-3-small")
-_KB_EMB: Optional[np.ndarray] = None  # shape=(N, D), float32, normalized
-
-
-def _l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    n = np.linalg.norm(x, axis=1, keepdims=True)
-    return x / np.maximum(n, eps)
-
-
-def init_kb_embeddings() -> None:
-    global _KB_EMB
-    if _KB_EMB is not None:
-        return
-
-    texts = [e["text"] for e in KB_ENTRIES]
-    logger.info("[KB] Building embeddings: model=%s, n=%d", KB_EMBED_MODEL, len(texts))
-
-    # まとめて投げる（量が多いなら分割）
-    resp = client.embeddings.create(
-        model=KB_EMBED_MODEL,
-        input=texts,
-    )
-    emb = np.array([d.embedding for d in resp.data], dtype=np.float32)
-    emb = _l2_normalize(emb)
-    _KB_EMB = emb
-
-    logger.info("[KB] Embeddings ready: shape=%s", str(_KB_EMB.shape))
-
-
-def build_rag_query(match_payload: Dict[str, Any], max_chars: int = 1200) -> str:
-    """
-    試合イベントから埋め込み用クエリを作る（短く濃く）。
-    """
-    parts: List[str] = []
-
-    # 試合概要
-    for k in ["tournament", "round", "venue"]:
-        v = match_payload.get(k)
-        if v:
-            parts.append(str(v))
-
-    events = match_payload.get("events") or []
-    if isinstance(events, list):
-        for ev in events[:30]:
-            t = ev.get("type")
-            n = ev.get("note")
-            h = ev.get("half")
-            if h: parts.append(f"half:{h}")
-            if t: parts.append(f"type:{t}")
-            if n: parts.append(f"note:{n}")
-
-    q = " / ".join(parts)
-    if not q.strip():
-        q = "フットサル 試合レポート 戦術 配置 守備 攻撃 セットプレイ"
-    return q[:max_chars]
-
-
-def retrieve_top_k_kb(match_payload: Dict[str, Any], k: int = 4) -> List[Tuple[str, str, float]]:
-    """
-    OpenAI埋め込み + cosine で Top-k を返す
-    戻り: (KBid, text, score)
-    """
-    init_kb_embeddings()
-    assert _KB_EMB is not None
-
-    query = build_rag_query(match_payload)
-    q_resp = client.embeddings.create(
-        model=KB_EMBED_MODEL,
-        input=[query],
-    )
-    q = np.array([q_resp.data[0].embedding], dtype=np.float32)
-    q = _l2_normalize(q)  # shape=(1, D)
-
-    # cosine similarity = dot (normalized)
-    scores = (_KB_EMB @ q[0]).astype(np.float32)  # shape=(N,)
-    top_idx = np.argsort(-scores)[:k]
-
-    results: List[Tuple[str, str, float]] = []
-    for i in top_idx:
-        results.append((KB_ENTRIES[int(i)]["id"], KB_ENTRIES[int(i)]["text"], float(scores[int(i)])))
-    return results
-
-
-def extract_used_kb_ids(text: str) -> List[str]:
-    """
-    出力文中の [KBxxx] を抽出
-    """
-    ids = re.findall(r"\bKB\d{3}\b", text or "")
-    # 重複除去（順序維持）
-    seen = set()
-    out = []
-    for x in ids:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+_KB_VECS: Optional[np.ndarray] = None  # (N, d) normalized
+_KB_READY: bool = False
 
 
 # =========================
-# Event formatting
+# Config (system prompt)
 # =========================
-def normalize_half(v: Any) -> str:
+_DEFAULT_SYSTEM_PROMPT = """\
+あなたはフットサルの試合レポートを書くスポーツライターです。
+与えられた試合記録（テキスト情報）と戦術ボード画像をもとに、日本語で読みやすい試合レポートを書いてください。
+
+- 試合の概要（大会名・カテゴリ・対戦カード・会場など）を最初に一文でまとめる
+- スコアとゴールの時間・得点者を時系列で整理する
+- シュートやファウルなども整理する
+- 画像がある場合のみ、画像から分かる「配置」「マークの付き方」「数的優位/劣位」「狙い」なども言及する
+- ハイライトシーンを2〜3個ピックアップして、状況や流れの変化が分かるように書く
+- 最後に「この試合の収穫と今後の課題」を短くまとめる
+- だいたい 600文字程度
+
+重要:
+- 後半イベントが与えられていない場合、後半について推測・創作して書かない（後半は触れない）
+"""
+
+
+def _resolve_config_path() -> Path:
+    base_dir = Path(__file__).resolve().parent
+    p = Path(CONFIG_PATH)
+    if not p.is_absolute():
+        p = base_dir / p
+    return p
+
+
+def load_system_prompt() -> str:
+    p = _resolve_config_path()
+    logger.info("[CONFIG] cwd=%s", str(Path.cwd()))
+    logger.info("[CONFIG] config_path=%s exists=%s", str(p), p.exists())
+    if not p.exists():
+        logger.warning("[CONFIG] config.json not found -> use default prompt")
+        return _DEFAULT_SYSTEM_PROMPT
+
+    try:
+        config = json.loads(p.read_text(encoding="utf-8"))
+        s = config.get("system_prompt")
+        if not isinstance(s, str) or not s.strip():
+            logger.warning("[CONFIG] system_prompt missing/empty -> use default prompt")
+            return _DEFAULT_SYSTEM_PROMPT
+        return s
+    except Exception as e:
+        logger.exception("[CONFIG] failed to load config.json: %s", e)
+        return _DEFAULT_SYSTEM_PROMPT
+
+
+def _augment_system_prompt(base: str) -> str:
     """
-    受け取りうる half 表記を正規化して "1st"/"2nd"/"unknown" にする
+    ユーザーのpromptに「内部タグ」要求を追加（出力からは除去して返す）
+    """
+    extra = """
+【内部ルール（ユーザーには表示しない）】
+- 与えたRAG知識（KBxxx）を使った場合、レポート本文にIDは書かず、
+  末尾に次の1行を必ず付ける：
+  <RAG_USED>KB001,KB002</RAG_USED>
+  使わなかった場合は：
+  <RAG_USED>none</RAG_USED>
+"""
+    # {futsal_knowledge} が残っていても壊れないように置換だけする
+    base = base.replace("{futsal_knowledge}", "（関連知識はRAGで追記します）")
+    return base.strip() + "\n\n" + extra.strip()
+
+
+SYSTEM_PROMPT = _augment_system_prompt(load_system_prompt())
+logger.info("[PROMPT] loaded length=%d", len(SYSTEM_PROMPT))
+
+
+# =========================
+# Helpers: half normalize / snapshot extract
+# =========================
+def normalize_half(v: Any) -> Optional[str]:
+    """
+    入力の揺れを吸収して '1st' / '2nd' / None にする
     """
     if v is None:
-        return "unknown"
+        return None
 
-    # 数値系
-    if isinstance(v, (int, float)):
+    # int / float / bool
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
         if int(v) == 1:
             return "1st"
         if int(v) == 2:
             return "2nd"
-        return "unknown"
+        return None
 
-    s = str(v).strip().lower()
+    s = str(v).strip()
+    if not s:
+        return None
 
-    first_keys = {
-        "1st", "first", "firsthalf", "first_half", "1h", "h1", "前半", "前", "前ハーフ", "前半戦"
-    }
-    second_keys = {
-        "2nd", "second", "secondhalf", "second_half", "2h", "h2", "後半", "後", "後ハーフ", "後半戦"
-    }
+    s_low = s.lower()
 
-    s2 = re.sub(r"[\s\-_]", "", s)  # 空白/ハイフン/アンダーバー除去
-    if s in first_keys or s2 in first_keys:
+    # 1st patterns
+    if s_low in {"1st", "1", "1h", "1sthalf", "first", "firsthalf"}:
         return "1st"
-    if s in second_keys or s2 in second_keys:
+    if "前半" in s or s_low in {"zenhan", "1half"}:
+        return "1st"
+
+    # 2nd patterns
+    if s_low in {"2nd", "2", "2h", "2ndhalf", "second", "secondhalf"}:
+        return "2nd"
+    if "後半" in s or s_low in {"kouhan", "2half"}:
         return "2nd"
 
-    # "1st half" / "2nd half" 系
-    if "1st" in s2 or "first" in s2:
+    # more fuzzy
+    if re.search(r"\b1(st)?\b", s_low) and "half" in s_low:
         return "1st"
-    if "2nd" in s2 or "second" in s2:
+    if re.search(r"\b2(nd)?\b", s_low) and "half" in s_low:
         return "2nd"
 
-    return "unknown"
+    return None
 
 
-def get_snapshot_path(ev: Dict[str, Any]) -> Optional[str]:
+def extract_snapshot_path(ev: Dict[str, Any]) -> Optional[str]:
     """
-    snapshotPath のキー揺れを吸収
+    Swift側のキー揺れを吸収して snapshotPath を取り出す
     """
-    return (
-        ev.get("snapshotPath")
-        or ev.get("snapshot_path")
-        or ev.get("snapshotURL")
-        or ev.get("snapshotUrl")
-        or ev.get("snapshot")
-    )
+    keys = [
+        "snapshotPath",
+        "snapshot_path",
+        "snapshotURL",
+        "snapshotUrl",
+        "boardSnapshotPath",
+        "boardImagePath",
+        "imagePath",
+        "image_url",
+        "imageUrl",
+    ]
+    for k in keys:
+        v = ev.get(k)
+        if isinstance(v, str) and v.strip():
+            if v == "string" or v.startswith("data:"):
+                return None
+            return v.strip()
+    return None
 
 
-def build_image_url(snapshot_path: str) -> str:
+def to_image_url(snapshot_path: str) -> str:
     """
-    relative -> absolute
+    相対パスなら SNAPSHOT_BASE_URL を付与
     """
-    sp = snapshot_path.strip()
-    if sp.startswith("http://") or sp.startswith("https://"):
-        return sp
+    if snapshot_path.startswith("http://") or snapshot_path.startswith("https://"):
+        return snapshot_path
+    sp = snapshot_path
     if not sp.startswith("/"):
         sp = "/" + sp
-    return SNAPSHOT_BASE_URL + sp
+    return SNAPSHOT_BASE_URL.rstrip("/") + sp
 
 
+# =========================
+# Embeddings RAG
+# =========================
+def _embed_texts(texts: List[str]) -> np.ndarray:
+    """
+    OpenAI Embeddings -> (len(texts), d)
+    """
+    resp = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=texts,
+    )
+    vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
+    return vecs
+
+
+def _ensure_kb_ready() -> None:
+    global _KB_VECS, _KB_READY
+    if _KB_READY and _KB_VECS is not None:
+        return
+
+    try:
+        texts = [x["text"] for x in KB]
+        vecs = _embed_texts(texts)
+        # normalize
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+        vecs = vecs / norms
+        _KB_VECS = vecs
+        _KB_READY = True
+        logger.info("[RAG] KB embeddings ready: n=%d dim=%d model=%s", vecs.shape[0], vecs.shape[1], EMBEDDING_MODEL)
+    except Exception as e:
+        logger.exception("[RAG] failed to build KB embeddings: %s", e)
+        _KB_VECS = None
+        _KB_READY = False
+
+
+def retrieve_kb(query: str, top_k: int) -> List[Tuple[str, float, str]]:
+    """
+    return list of (KBid, score, text)
+    cosine similarity (because normalized)
+    """
+    _ensure_kb_ready()
+    if _KB_VECS is None:
+        return []
+
+    q_vec = _embed_texts([query])[0]
+    q_vec = q_vec / (np.linalg.norm(q_vec) + 1e-12)
+
+    scores = _KB_VECS @ q_vec  # (N,)
+    idx = np.argsort(-scores)[: max(1, top_k)]
+    out: List[Tuple[str, float, str]] = []
+    for i in idx:
+        kb = KB[int(i)]
+        out.append((kb["id"], float(scores[int(i)]), kb["text"]))
+    return out
+
+
+# =========================
+# Prompt build
+# =========================
 def _build_event_text(ev: Dict[str, Any]) -> str:
     half_raw = ev.get("half")
-    half_norm = normalize_half(half_raw)
+    half = normalize_half(half_raw) or "unknown"
 
     minute_raw = ev.get("minute")
     second_raw = ev.get("second")
-    team_side = ev.get("teamSide")  # "home"/"away"/None
+
+    team_side = ev.get("teamSide")  # "home" / "away" / None
     main_no = ev.get("mainPlayerNumber")
     assist_no = ev.get("assistPlayerNumber")
     note = ev.get("note") or ""
     ev_type = ev.get("type") or ""
 
-    # 時間
+    # safe time
     minute = None
     second = None
     try:
@@ -305,37 +325,37 @@ def _build_event_text(ev: Dict[str, Any]) -> str:
         minute = None
         second = None
 
-    half_label = {"1st": "前半", "2nd": "後半", "unknown": "ハーフ不明"}[half_norm]
     if minute is not None and second is not None:
-        time_str = f"{half_label} {minute:02d}:{second:02d}"
+        time_str = f"{half} {minute:02d}:{second:02d}"
     else:
-        time_str = half_label
+        time_str = half
 
-    # チーム側
+    # side
     if team_side == "home":
         side_str = "ホーム"
     elif team_side == "away":
         side_str = "アウェイ"
     else:
-        side_str = "不明チーム"
+        side_str = "不明"
 
-    # 選手
     players = []
     if main_no is not None:
-        players.append(f"背番号{main_no}")
+        players.append(f"主:#{main_no}")
     if assist_no is not None:
-        players.append(f"アシスト背番号{assist_no}")
+        players.append(f"助:#{assist_no}")
 
-    players_str = (" / " + "・".join(players)) if players else ""
-    note_str = f" / メモ:{note}" if note else ""
+    players_str = (" " + " ".join(players)) if players else ""
+    note_str = f" メモ:{note}" if note else ""
 
-    return f"[{time_str}] {side_str} {ev_type}{players_str}{note_str}"
+    return f"[{time_str}]({side_str}) {ev_type}{players_str}{note_str}".strip()
 
 
-# =========================
-# Build multimodal input
-# =========================
-def build_multimodal_input(match_payload: Dict[str, Any], rag_items: List[Tuple[str, str, float]]) -> List[Dict[str, Any]]:
+def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    returns: (messages, meta)
+    meta includes counts for logging
+    """
+    match_id = match_payload.get("matchId")
     venue = match_payload.get("venue") or "会場不明"
     tournament = match_payload.get("tournament") or "大会名不明"
     round_desc = match_payload.get("round") or "ラウンド不明"
@@ -346,142 +366,192 @@ def build_multimodal_input(match_payload: Dict[str, Any], rag_items: List[Tuple[
     home_name = home.get("name", "ホーム")
     away_name = away.get("name", "アウェイ")
 
-    events = match_payload.get("events") or []
-    if not isinstance(events, list):
-        events = []
+    events = match_payload.get("events", []) or []
 
-    # half別に分ける（unknown も落とさない）
-    first_half_events = []
-    second_half_events = []
-    unknown_half_events = []
+    first: List[Dict[str, Any]] = []
+    second: List[Dict[str, Any]] = []
+    unknown: List[Dict[str, Any]] = []
+
+    # snapshot counting (we count paths)
+    snapshot_paths: List[str] = []
+
+    unknown_half_samples: List[str] = []
+
     for ev in events:
-        hn = normalize_half(ev.get("half"))
-        if hn == "1st":
-            first_half_events.append(ev)
-        elif hn == "2nd":
-            second_half_events.append(ev)
+        h_norm = normalize_half(ev.get("half"))
+        if h_norm == "1st":
+            first.append(ev)
+        elif h_norm == "2nd":
+            second.append(ev)
         else:
-            unknown_half_events.append(ev)
+            unknown.append(ev)
+            # sample raw values for log
+            raw = ev.get("half")
+            if raw is not None and len(unknown_half_samples) < 8:
+                unknown_half_samples.append(str(raw))
 
-    # snapshot が何件あるか
-    snapshot_count = 0
-    for ev in events:
-        sp = get_snapshot_path(ev)
-        if sp and sp != "string" and not str(sp).startswith("data:"):
-            snapshot_count += 1
+        sp = extract_snapshot_path(ev)
+        if sp:
+            snapshot_paths.append(sp)
 
-    logger.info(
-        "[PAYLOAD] events=%d (1st=%d, 2nd=%d, unknown=%d) snapshots=%d venue=%s",
-        len(events), len(first_half_events), len(second_half_events), len(unknown_half_events),
-        snapshot_count, venue
-    )
+    meta = {
+        "matchId": str(match_id) if match_id is not None else None,
+        "venue": venue,
+        "tournament": tournament,
+        "home": home_name,
+        "away": away_name,
+        "events_total": len(events),
+        "events_1st": len(first),
+        "events_2nd": len(second),
+        "events_unknown": len(unknown),
+        "unknown_half_samples": unknown_half_samples,
+        "snapshots": len(snapshot_paths),
+    }
 
+    # ----- RAG query text (短く要約して埋め込み) -----
+    # 事件が多いと長くなるので、先頭だけ使う（情報は十分）
+    ev_texts_for_query = []
+    for ev in events[:40]:
+        ev_type = str(ev.get("type") or "")
+        note = str(ev.get("note") or "")
+        half = str(ev.get("half") or "")
+        ev_texts_for_query.append(f"{half}:{ev_type}:{note}".strip(":"))
+    query = f"{tournament} {venue} {home_name} vs {away_name} " + " ".join(ev_texts_for_query)
+    query = query[:2500]  # safety
+
+    rag_hits = retrieve_kb(query, RAG_TOP_K)
+    meta["rag_top_k"] = len(rag_hits)
+
+    # ----- user content -----
     header_text = (
         f"大会: {tournament}\n"
         f"ラウンド: {round_desc}\n"
         f"会場: {venue}\n"
         f"日時(キックオフ想定): {kickoff}\n"
         f"対戦カード: {home_name} vs {away_name}\n"
-        f"イベント件数: 前半{len(first_half_events)}件 / 後半{len(second_half_events)}件 / 不明{len(unknown_half_events)}件\n"
+        f"イベント数: {len(events)}（前半={len(first)} / 後半={len(second)} / half不明={len(unknown)}）\n"
+        f"戦術ボード画像: {len(snapshot_paths)}枚\n"
     )
 
-    # RAG block（モデルに渡す）＋（ログにも出す）
-    rag_lines = []
-    for kb_id, text, score in rag_items:
-        rag_lines.append(f"{kb_id} (score={score:.3f}): {text}")
-    rag_block = "【RAG: 参照用知識】\n" + "\n".join(rag_lines) + "\n"
+    # 後半が0なら明示（モデルの“補完”を止める）
+    half_notice = ""
+    if len(second) == 0:
+        half_notice = "【重要】後半イベントは 0件（未提供）です。後半について推測・創作して書かないでください。\n"
 
-    # ★ここが「RAGが本当に渡ってる」確認ポイント（Render logs に出る）
-    logger.info("[RAG] top=%d", len(rag_items))
-    for kb_id, text, score in rag_items:
-        logger.info("[RAG] %s score=%.3f text=%s", kb_id, score, text)
+    rag_text = ""
+    if rag_hits:
+        rag_lines = [f"- {kb_id}: {txt}" for (kb_id, _score, txt) in rag_hits]
+        rag_text = (
+            "【RAG: 関連知識（参考）】\n"
+            "※本文にKBのIDは書かないでください。必要なら内容だけ自然に使ってください。\n"
+            + "\n".join(rag_lines)
+            + "\n"
+        )
+    else:
+        rag_text = "【RAG: 関連知識】該当なし\n"
 
     user_content: List[Dict[str, Any]] = []
+    user_content.append({"type": "input_text", "text": "【試合概要】\n" + header_text + "\n" + half_notice + "\n" + rag_text})
 
-    intro_text = (
-        "以下にフットサルの試合記録（テキスト）と、各イベントに対応する戦術ボード画像を与えます。\n"
-        "与えられた情報だけを使ってレポートを書いてください（推測・創作禁止）。\n\n"
-        "【試合概要】\n"
-        f"{header_text}\n"
-        "【イベント一覧】\n"
-        "※後半イベントが0件のとき、後半について推測して書かない。\n"
-    )
-    user_content.append({"type": "input_text", "text": intro_text})
+    # --- 前半 ---
+    if first:
+        user_content.append({"type": "input_text", "text": "\n--- 前半イベント ---\n"})
+        for idx, ev in enumerate(first, start=1):
+            user_content.append({"type": "input_text", "text": f"前半#{idx} " + _build_event_text(ev)})
+            sp = extract_snapshot_path(ev)
+            if sp:
+                user_content.append({"type": "input_image", "image_url": to_image_url(sp)})
 
-    # 前半
-    if first_half_events:
-        user_content.append({"type": "input_text", "text": "\n--- 前半 ---\n"})
-        for idx, ev in enumerate(first_half_events, start=1):
-            user_content.append({"type": "input_text", "text": f"前半イベント{idx}: {_build_event_text(ev)}"})
-            sp = get_snapshot_path(ev)
-            if sp and sp != "string" and not str(sp).startswith("data:"):
-                user_content.append({"type": "input_image", "image_url": build_image_url(str(sp))})
+    # --- 後半（ある場合のみ） ---
+    if second:
+        user_content.append({"type": "input_text", "text": "\n--- 後半イベント ---\n"})
+        for idx, ev in enumerate(second, start=1):
+            user_content.append({"type": "input_text", "text": f"後半#{idx} " + _build_event_text(ev)})
+            sp = extract_snapshot_path(ev)
+            if sp:
+                user_content.append({"type": "input_image", "image_url": to_image_url(sp)})
 
-    # 後半：0件なら明示（＝幻覚防止）
-    if second_half_events:
-        user_content.append({"type": "input_text", "text": "\n--- 後半 ---\n"})
-        for idx, ev in enumerate(second_half_events, start=1):
-            user_content.append({"type": "input_text", "text": f"後半イベント{idx}: {_build_event_text(ev)}"})
-            sp = get_snapshot_path(ev)
-            if sp and sp != "string" and not str(sp).startswith("data:"):
-                user_content.append({"type": "input_image", "image_url": build_image_url(str(sp))})
-    else:
-        user_content.append({"type": "input_text", "text": "\n後半の記録は未提供（0件）。※後半について推測して書かない。\n"})
-
-    # half不明：落とさず別枠で渡す（ここが “前半が未提供になる” の最大原因潰し）
-    if unknown_half_events:
-        user_content.append({"type": "input_text", "text": "\n--- ハーフ不明（入力のhalf表記を要確認） ---\n"})
-        for idx, ev in enumerate(unknown_half_events, start=1):
-            user_content.append({"type": "input_text", "text": f"不明イベント{idx}: {_build_event_text(ev)}"})
-            sp = get_snapshot_path(ev)
-            if sp and sp != "string" and not str(sp).startswith("data:"):
-                user_content.append({"type": "input_image", "image_url": build_image_url(str(sp))})
-
-    # RAG 知識を user message に “input_text” として追加（重要）
-    user_content.append({"type": "input_text", "text": "\n" + rag_block})
+    # --- half不明（ログ的には重要なので“別枠”で渡す：正規化できないときの保険） ---
+    # ここを渡す/渡さないは好みだが、今は「情報落ち」を防ぐため渡す（ただし明確にunknown扱いにする）
+    if unknown:
+        user_content.append({"type": "input_text", "text": "\n--- half不明イベント（表記揺れの可能性） ---\n"})
+        for idx, ev in enumerate(unknown, start=1):
+            user_content.append({"type": "input_text", "text": f"unknown#{idx} " + _build_event_text(ev)})
+            sp = extract_snapshot_path(ev)
+            if sp:
+                user_content.append({"type": "input_image", "image_url": to_image_url(sp)})
 
     messages = [
         {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
         {"role": "user", "content": user_content},
     ]
-    return messages
+
+    # ----- logs (RAG hits) -----
+    logger.info(
+        "[PAYLOAD] events=%d (1st=%d, 2nd=%d, unknown=%d) snapshots=%d venue=%s",
+        meta["events_total"], meta["events_1st"], meta["events_2nd"], meta["events_unknown"], meta["snapshots"], venue
+    )
+    if unknown_half_samples:
+        logger.info("[PAYLOAD] unknown half samples=%s", ",".join(unknown_half_samples))
+
+    if rag_hits:
+        logger.info("[RAG] top=%d", len(rag_hits))
+        for kb_id, score, txt in rag_hits:
+            logger.info("[RAG] %s score=%.3f text=%s", kb_id, score, (txt[:120] + "…") if len(txt) > 120 else txt)
+    else:
+        logger.info("[RAG] top=0 (no hits or KB not ready)")
+
+    logger.info("[SEND] messages=%d (system+user)", len(messages))
+    return messages, meta
+
+
+def _extract_rag_used_ids(text: str) -> List[str]:
+    """
+    <RAG_USED>KB001,KB002</RAG_USED> を抽出
+    """
+    m = re.search(r"<RAG_USED>(.*?)</RAG_USED>", text, flags=re.DOTALL)
+    if not m:
+        return []
+    raw = m.group(1).strip()
+    if raw.lower() == "none" or raw == "":
+        return []
+    ids = [x.strip() for x in raw.split(",") if x.strip()]
+    # KBxxx形式だけに絞る
+    ids = [x for x in ids if re.fullmatch(r"KB\d{3}", x)]
+    return ids
+
+
+def _strip_internal_tags(text: str) -> str:
+    """
+    ユーザーに返す本文から内部タグを除去
+    """
+    text = re.sub(r"\n?<RAG_USED>.*?</RAG_USED>\n?", "\n", text, flags=re.DOTALL)
+    return text.strip()
 
 
 # =========================
-# Main entry
+# Public: generate report
 # =========================
 def generate_match_report(match_payload: Dict[str, Any]) -> str:
-    """
-    FastAPI から呼ばれる想定。
-    """
-    try:
-        rag_items = retrieve_top_k_kb(match_payload, k=4)
-        messages = build_multimodal_input(match_payload, rag_items)
+    messages, _meta = build_multimodal_messages(match_payload)
 
-        logger.debug("[SEND] SYSTEM_PROMPT(head200)=%s", SYSTEM_PROMPT[:200])
-        logger.info("[SEND] messages=%d", len(messages))
+    response = client.responses.create(
+        model=CHAT_MODEL,
+        input=messages,
+    )
 
-        response = client.responses.create(
-            model=os.getenv("REPORT_MODEL", "o4-mini"),
-            input=messages,
-        )
+    out = response.output_text or ""
+    logger.info("[RESULT] length=%d", len(out))
 
-        out = response.output_text or ""
-        logger.info("[RESULT] length=%d", len(out))
+    used_ids = _extract_rag_used_ids(out)
+    if used_ids:
+        logger.info("[RAG-USED] ids=%s", ",".join(used_ids))
+        # 使ったIDの本文もログに出す
+        used_map = {kb["id"]: kb["text"] for kb in KB}
+        for kb_id in used_ids:
+            txt = used_map.get(kb_id, "")
+            logger.info("[RAG-USED] %s text=%s", kb_id, (txt[:140] + "…") if len(txt) > 140 else txt)
+    else:
+        logger.info("[RAG-USED] ids=none")
 
-        # 出力に含まれたKB参照ID（[KBxxx]）をログに出す
-        used_ids = extract_used_kb_ids(out)
-        if used_ids:
-            logger.info("[RAG-USED] ids=%s", ",".join(used_ids))
-            # “IDと中身”を Render logs に出したい → ここで展開
-            id_to_text = {e["id"]: e["text"] for e in KB_ENTRIES}
-            for kb_id in used_ids:
-                logger.info("[RAG-USED] %s text=%s", kb_id, id_to_text.get(kb_id, "NOT_FOUND"))
-        else:
-            logger.info("[RAG-USED] none (モデルが [KBxxx] を付けなかった可能性)")
-
-        return out
-
-    except Exception as e:
-        logger.exception("[ERROR] generate_match_report failed: %s", e)
-        return "レポート生成中にエラーが発生しました。ログを確認してください。"
+    return _strip_internal_tags(out)
