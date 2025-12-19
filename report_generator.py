@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
+import openai
 from openai import OpenAI
 
 # =========================
@@ -20,6 +21,10 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
+
+# 交代/タイムアウトは画像不要
+SKIP_SNAPSHOT_TYPES = os.getenv("SKIP_SNAPSHOT_TYPES", "substitution,timeout,交代,タイムアウト")
+RETRY_NOIMG_ON_URL_TIMEOUT = os.getenv("RETRY_NOIMG_ON_URL_TIMEOUT", "1") == "1"
 
 client = OpenAI()
 
@@ -46,7 +51,7 @@ _KB_TEXTS: List[str] = [
     "フットサルで使われるボールはサッカーよりも小さく、重さが異なる。",
     "フットサルの試合でファウルが累積され、5回を超えると相手チームにフリーキックが与えられる。",
 
-    # 戦術用語（※文章は長くてもOK）
+    # 戦術用語
     "4-0フォーメーション（クワトロ）は、4人がフラットに広がりパス回しで崩す攻撃的配置。相手の守備を横に揺さぶり、アイソレーションを作りやすい。",
     "3-1フォーメーション（低め）は、3人が後方で安定し、1人（ピヴォ）を起点に前線で収める。守備は安定しやすく、攻撃はピヴォ当てから展開する。",
     "2-2フォーメーション（ボックス型）は、2人守備＋2人攻撃の近い距離で連動しやすい。縦関係が作りやすく、中央を使った崩しやカウンターにも移りやすい。",
@@ -83,10 +88,7 @@ _KB_TEXTS: List[str] = [
     "ゴールキック等では安全な前進（保持）と、一気の前進（裏）を状況で選ぶ。",
 ]
 
-KB: List[Dict[str, str]] = []
-for i, t in enumerate(_KB_TEXTS, start=1):
-    KB.append({"id": f"KB{i:03d}", "text": t})
-
+KB: List[Dict[str, str]] = [{"id": f"KB{i:03d}", "text": t} for i, t in enumerate(_KB_TEXTS, start=1)]
 _KB_VECS: Optional[np.ndarray] = None  # (N, d) normalized
 _KB_READY: bool = False
 
@@ -151,7 +153,6 @@ def _augment_system_prompt(base: str) -> str:
   使わなかった場合は：
   <RAG_USED>none</RAG_USED>
 """
-    # {futsal_knowledge} が残っていても壊れないように置換だけする
     base = base.replace("{futsal_knowledge}", "（関連知識はRAGで追記します）")
     return base.strip() + "\n\n" + extra.strip()
 
@@ -161,8 +162,34 @@ logger.info("[PROMPT] loaded length=%d", len(SYSTEM_PROMPT))
 
 
 # =========================
-# Helpers: half normalize / snapshot extract
+# Helpers: snapshot skip / half normalize / snapshot extract
 # =========================
+def _skip_snapshot_type_set() -> List[str]:
+    return [x.strip().lower() for x in SKIP_SNAPSHOT_TYPES.split(",") if x.strip()]
+
+
+def should_send_snapshot(ev: Dict[str, Any]) -> bool:
+    """
+    交代/タイムアウト等は画像不要なので送らない
+    """
+    t = str(ev.get("type") or "").strip()
+    if not t:
+        return True
+    t_low = t.lower()
+
+    # 完全一致（英語系）
+    if t_low in set(_skip_snapshot_type_set()):
+        return False
+
+    # 部分一致（日本語や表記揺れ）
+    if "交代" in t or "タイムアウト" in t:
+        return False
+    if "substitution" in t_low or "timeout" in t_low:
+        return False
+
+    return True
+
+
 def normalize_half(v: Any) -> Optional[str]:
     """
     入力の揺れを吸収して '1st' / '2nd' / None にする
@@ -170,7 +197,6 @@ def normalize_half(v: Any) -> Optional[str]:
     if v is None:
         return None
 
-    # int / float / bool
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         if int(v) == 1:
             return "1st"
@@ -245,9 +271,6 @@ def to_image_url(snapshot_path: str) -> str:
 # Embeddings RAG
 # =========================
 def _embed_texts(texts: List[str]) -> np.ndarray:
-    """
-    OpenAI Embeddings -> (len(texts), d)
-    """
     resp = client.embeddings.create(
         model=EMBEDDING_MODEL,
         input=texts,
@@ -264,7 +287,6 @@ def _ensure_kb_ready() -> None:
     try:
         texts = [x["text"] for x in KB]
         vecs = _embed_texts(texts)
-        # normalize
         norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
         vecs = vecs / norms
         _KB_VECS = vecs
@@ -277,10 +299,6 @@ def _ensure_kb_ready() -> None:
 
 
 def retrieve_kb(query: str, top_k: int) -> List[Tuple[str, float, str]]:
-    """
-    return list of (KBid, score, text)
-    cosine similarity (because normalized)
-    """
     _ensure_kb_ready()
     if _KB_VECS is None:
         return []
@@ -288,7 +306,7 @@ def retrieve_kb(query: str, top_k: int) -> List[Tuple[str, float, str]]:
     q_vec = _embed_texts([query])[0]
     q_vec = q_vec / (np.linalg.norm(q_vec) + 1e-12)
 
-    scores = _KB_VECS @ q_vec  # (N,)
+    scores = _KB_VECS @ q_vec  # cosine similarity
     idx = np.argsort(-scores)[: max(1, top_k)]
     out: List[Tuple[str, float, str]] = []
     for i in idx:
@@ -313,7 +331,6 @@ def _build_event_text(ev: Dict[str, Any]) -> str:
     note = ev.get("note") or ""
     ev_type = ev.get("type") or ""
 
-    # safe time
     minute = None
     second = None
     try:
@@ -330,7 +347,6 @@ def _build_event_text(ev: Dict[str, Any]) -> str:
     else:
         time_str = half
 
-    # side
     if team_side == "home":
         side_str = "ホーム"
     elif team_side == "away":
@@ -351,10 +367,6 @@ def _build_event_text(ev: Dict[str, Any]) -> str:
 
 
 def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    returns: (messages, meta)
-    meta includes counts for logging
-    """
     match_id = match_payload.get("matchId")
     venue = match_payload.get("venue") or "会場不明"
     tournament = match_payload.get("tournament") or "大会名不明"
@@ -372,8 +384,10 @@ def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[
     second: List[Dict[str, Any]] = []
     unknown: List[Dict[str, Any]] = []
 
-    # snapshot counting (we count paths)
-    snapshot_paths: List[str] = []
+    # snapshots
+    snapshot_sent_paths: List[str] = []
+    snapshot_skipped_paths: List[str] = []
+    skipped_snapshot_types_samples: List[str] = []
 
     unknown_half_samples: List[str] = []
 
@@ -385,14 +399,18 @@ def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[
             second.append(ev)
         else:
             unknown.append(ev)
-            # sample raw values for log
             raw = ev.get("half")
             if raw is not None and len(unknown_half_samples) < 8:
                 unknown_half_samples.append(str(raw))
 
         sp = extract_snapshot_path(ev)
         if sp:
-            snapshot_paths.append(sp)
+            if should_send_snapshot(ev):
+                snapshot_sent_paths.append(sp)
+            else:
+                snapshot_skipped_paths.append(sp)
+                if len(skipped_snapshot_types_samples) < 8:
+                    skipped_snapshot_types_samples.append(str(ev.get("type") or ""))
 
     meta = {
         "matchId": str(match_id) if match_id is not None else None,
@@ -405,11 +423,12 @@ def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[
         "events_2nd": len(second),
         "events_unknown": len(unknown),
         "unknown_half_samples": unknown_half_samples,
-        "snapshots": len(snapshot_paths),
+        "snapshots_sent": len(snapshot_sent_paths),
+        "snapshots_skipped": len(snapshot_skipped_paths),
+        "skipped_snapshot_type_samples": skipped_snapshot_types_samples,
     }
 
-    # ----- RAG query text (短く要約して埋め込み) -----
-    # 事件が多いと長くなるので、先頭だけ使う（情報は十分）
+    # ----- RAG query text -----
     ev_texts_for_query = []
     for ev in events[:40]:
         ev_type = str(ev.get("type") or "")
@@ -417,12 +436,11 @@ def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[
         half = str(ev.get("half") or "")
         ev_texts_for_query.append(f"{half}:{ev_type}:{note}".strip(":"))
     query = f"{tournament} {venue} {home_name} vs {away_name} " + " ".join(ev_texts_for_query)
-    query = query[:2500]  # safety
+    query = query[:2500]
 
     rag_hits = retrieve_kb(query, RAG_TOP_K)
     meta["rag_top_k"] = len(rag_hits)
 
-    # ----- user content -----
     header_text = (
         f"大会: {tournament}\n"
         f"ラウンド: {round_desc}\n"
@@ -430,13 +448,18 @@ def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[
         f"日時(キックオフ想定): {kickoff}\n"
         f"対戦カード: {home_name} vs {away_name}\n"
         f"イベント数: {len(events)}（前半={len(first)} / 後半={len(second)} / half不明={len(unknown)}）\n"
-        f"戦術ボード画像: {len(snapshot_paths)}枚\n"
+        f"戦術ボード画像: 送信{len(snapshot_sent_paths)}枚（スキップ{len(snapshot_skipped_paths)}枚）\n"
     )
 
-    # 後半が0なら明示（モデルの“補完”を止める）
+    # 後半が0なら明示
     half_notice = ""
     if len(second) == 0:
         half_notice = "【重要】後半イベントは 0件（未提供）です。後半について推測・創作して書かないでください。\n"
+
+    # さらに unknown が残っている場合の保険
+    unknown_notice = ""
+    if len(second) == 0 and len(unknown) > 0:
+        unknown_notice = "【補足】half不明イベントは前半扱いとして時系列整理してください（後半扱いにしない）。\n"
 
     rag_text = ""
     if rag_hits:
@@ -451,15 +474,21 @@ def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[
         rag_text = "【RAG: 関連知識】該当なし\n"
 
     user_content: List[Dict[str, Any]] = []
-    user_content.append({"type": "input_text", "text": "【試合概要】\n" + header_text + "\n" + half_notice + "\n" + rag_text})
+    user_content.append(
+        {
+            "type": "input_text",
+            "text": "【試合概要】\n" + header_text + "\n" + half_notice + unknown_notice + "\n" + rag_text
+        }
+    )
 
     # --- 前半 ---
     if first:
         user_content.append({"type": "input_text", "text": "\n--- 前半イベント ---\n"})
         for idx, ev in enumerate(first, start=1):
             user_content.append({"type": "input_text", "text": f"前半#{idx} " + _build_event_text(ev)})
+
             sp = extract_snapshot_path(ev)
-            if sp:
+            if sp and should_send_snapshot(ev):
                 user_content.append({"type": "input_image", "image_url": to_image_url(sp)})
 
     # --- 後半（ある場合のみ） ---
@@ -467,18 +496,19 @@ def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[
         user_content.append({"type": "input_text", "text": "\n--- 後半イベント ---\n"})
         for idx, ev in enumerate(second, start=1):
             user_content.append({"type": "input_text", "text": f"後半#{idx} " + _build_event_text(ev)})
+
             sp = extract_snapshot_path(ev)
-            if sp:
+            if sp and should_send_snapshot(ev):
                 user_content.append({"type": "input_image", "image_url": to_image_url(sp)})
 
-    # --- half不明（ログ的には重要なので“別枠”で渡す：正規化できないときの保険） ---
-    # ここを渡す/渡さないは好みだが、今は「情報落ち」を防ぐため渡す（ただし明確にunknown扱いにする）
+    # --- half不明 ---
     if unknown:
         user_content.append({"type": "input_text", "text": "\n--- half不明イベント（表記揺れの可能性） ---\n"})
         for idx, ev in enumerate(unknown, start=1):
             user_content.append({"type": "input_text", "text": f"unknown#{idx} " + _build_event_text(ev)})
+
             sp = extract_snapshot_path(ev)
-            if sp:
+            if sp and should_send_snapshot(ev):
                 user_content.append({"type": "input_image", "image_url": to_image_url(sp)})
 
     messages = [
@@ -486,13 +516,16 @@ def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[
         {"role": "user", "content": user_content},
     ]
 
-    # ----- logs (RAG hits) -----
+    # ----- logs -----
     logger.info(
-        "[PAYLOAD] events=%d (1st=%d, 2nd=%d, unknown=%d) snapshots=%d venue=%s",
-        meta["events_total"], meta["events_1st"], meta["events_2nd"], meta["events_unknown"], meta["snapshots"], venue
+        "[PAYLOAD] events=%d (1st=%d, 2nd=%d, unknown=%d) snapshots_sent=%d snapshots_skipped=%d venue=%s",
+        meta["events_total"], meta["events_1st"], meta["events_2nd"], meta["events_unknown"],
+        meta["snapshots_sent"], meta["snapshots_skipped"], venue
     )
     if unknown_half_samples:
         logger.info("[PAYLOAD] unknown half samples=%s", ",".join(unknown_half_samples))
+    if skipped_snapshot_types_samples:
+        logger.info("[PAYLOAD] skipped snapshot type samples=%s", ",".join(skipped_snapshot_types_samples))
 
     if rag_hits:
         logger.info("[RAG] top=%d", len(rag_hits))
@@ -506,9 +539,6 @@ def build_multimodal_messages(match_payload: Dict[str, Any]) -> Tuple[List[Dict[
 
 
 def _extract_rag_used_ids(text: str) -> List[str]:
-    """
-    <RAG_USED>KB001,KB002</RAG_USED> を抽出
-    """
     m = re.search(r"<RAG_USED>(.*?)</RAG_USED>", text, flags=re.DOTALL)
     if not m:
         return []
@@ -516,17 +546,36 @@ def _extract_rag_used_ids(text: str) -> List[str]:
     if raw.lower() == "none" or raw == "":
         return []
     ids = [x.strip() for x in raw.split(",") if x.strip()]
-    # KBxxx形式だけに絞る
     ids = [x for x in ids if re.fullmatch(r"KB\d{3}", x)]
     return ids
 
 
 def _strip_internal_tags(text: str) -> str:
-    """
-    ユーザーに返す本文から内部タグを除去
-    """
     text = re.sub(r"\n?<RAG_USED>.*?</RAG_USED>\n?", "\n", text, flags=re.DOTALL)
     return text.strip()
+
+
+def _messages_without_images(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for m in messages:
+        content = m.get("content", [])
+        if isinstance(content, list):
+            content2 = [c for c in content if isinstance(c, dict) and c.get("type") != "input_image"]
+        else:
+            content2 = content
+        m2 = dict(m)
+        m2["content"] = content2
+        out.append(m2)
+    return out
+
+
+def _is_openai_url_timeout(exc: Exception) -> bool:
+    msg = str(exc)
+    # 代表的な文言
+    if "Timeout while downloading" in msg:
+        return True
+    # openai.BadRequestError の dict に含まれる場合もある
+    return False
 
 
 # =========================
@@ -535,10 +584,23 @@ def _strip_internal_tags(text: str) -> str:
 def generate_match_report(match_payload: Dict[str, Any]) -> str:
     messages, _meta = build_multimodal_messages(match_payload)
 
-    response = client.responses.create(
-        model=CHAT_MODEL,
-        input=messages,
-    )
+    try:
+        response = client.responses.create(
+            model=CHAT_MODEL,
+            input=messages,
+        )
+    except Exception as e:
+        # 画像URLのダウンロードタイムアウトなら、画像なしでリトライ
+        if RETRY_NOIMG_ON_URL_TIMEOUT and _is_openai_url_timeout(e):
+            logger.warning("[OPENAI] url download timeout -> retry without images")
+            messages2 = _messages_without_images(messages)
+            response = client.responses.create(
+                model=CHAT_MODEL,
+                input=messages2,
+            )
+        else:
+            logger.exception("[OPENAI] request failed: %s", e)
+            raise
 
     out = response.output_text or ""
     logger.info("[RESULT] length=%d", len(out))
@@ -546,7 +608,6 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
     used_ids = _extract_rag_used_ids(out)
     if used_ids:
         logger.info("[RAG-USED] ids=%s", ",".join(used_ids))
-        # 使ったIDの本文もログに出す
         used_map = {kb["id"]: kb["text"] for kb in KB}
         for kb_id in used_ids:
             txt = used_map.get(kb_id, "")
