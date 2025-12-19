@@ -3,8 +3,9 @@
 import os
 import json
 import logging
+import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 from openai import OpenAI
@@ -16,21 +17,22 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.DEBUG),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    force=True,  # ★ uvicorn等が先にlogger設定していても上書き
+    force=True,  # uvicorn等が先にlogger設定していても上書き
 )
 logger = logging.getLogger("report")
 
 client = OpenAI()
 
 SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", "https://futsal-report-api.onrender.com")
+REPORT_MODEL = os.getenv("REPORT_MODEL", "o4-mini")
 
 # =========================
 # config.json を確実に読む
 # =========================
 def load_prompt() -> str:
     """
-    - Renderだとカレントがズレることがあるので `__file__` 基準で config.json を読む
-    - どのファイルを読んだかをログに必ず出す
+    Renderだとカレントがズレることがあるので __file__ 基準で読む。
+    どのファイルを読んだかをログに必ず出す。
     """
     env_path = os.getenv("CONFIG_PATH")  # 任意で差し替え可能
     config_path = Path(env_path) if env_path else Path(__file__).with_name("config.json")
@@ -92,21 +94,13 @@ futsal_knowledge = [
 # =========================
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
-_knowledge_vecs: Optional[np.ndarray] = None
 _knowledge_vecs_norm: Optional[np.ndarray] = None
 
 
 def _embed_texts(texts: List[str]) -> np.ndarray:
-    """
-    OpenAI Embeddings を使って埋め込みを取得
-    戻り値: (N, D) の float32 numpy array
-    """
-    resp = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=texts,
-    )
-    vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
-    return vecs
+    """OpenAI Embeddings を使って埋め込みを取得。戻り値: (N, D) float32"""
+    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    return np.array([d.embedding for d in resp.data], dtype=np.float32)
 
 
 def _l2_normalize(mat: np.ndarray) -> np.ndarray:
@@ -115,16 +109,13 @@ def _l2_normalize(mat: np.ndarray) -> np.ndarray:
 
 
 def _ensure_knowledge_index() -> None:
-    """
-    知識ベクトルを一度だけ作ってメモリにキャッシュ
-    """
-    global _knowledge_vecs, _knowledge_vecs_norm
+    """知識ベクトルを一度だけ作ってメモリにキャッシュ"""
+    global _knowledge_vecs_norm
     if _knowledge_vecs_norm is not None:
         return
 
     logger.debug(f"[RAG] building knowledge embeddings: n={len(futsal_knowledge)} model={EMBEDDING_MODEL}")
     vecs = _embed_texts(futsal_knowledge)
-    _knowledge_vecs = vecs
     _knowledge_vecs_norm = _l2_normalize(vecs)
     logger.debug(f"[RAG] knowledge embedding shape={_knowledge_vecs_norm.shape}")
 
@@ -222,6 +213,8 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
     first_half_events = [ev for ev in events if ev.get("_half_norm") == "1st"]
     second_half_events = [ev for ev in events if ev.get("_half_norm") == "2nd"]
 
+    logger.debug(f"[events] total={len(events)} first_half={len(first_half_events)} second_half={len(second_half_events)}")
+
     user_content: List[Dict[str, Any]] = []
 
     intro_text = (
@@ -234,7 +227,7 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
     )
     user_content.append({"type": "input_text", "text": intro_text})
 
-    # ---- 前半 ----
+    # 前半イベント
     user_content.append({"type": "input_text", "text": "\n=== 前半イベント ===\n"})
     if first_half_events:
         for idx, ev in enumerate(first_half_events, start=1):
@@ -256,7 +249,7 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
     else:
         user_content.append({"type": "input_text", "text": "前半イベント: 未提供（0件）\n"})
 
-    # ---- 後半 ----（★未提供を強く明示）
+    # 後半イベント（未提供でも“明示”はするが、生成側には「書かない」指示を強く出してある）
     user_content.append({"type": "input_text", "text": "\n=== 後半イベント ===\n"})
     if second_half_events:
         for idx, ev in enumerate(second_half_events, start=1):
@@ -290,62 +283,102 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
     return messages
 
 
-def retrieve_rag_text(match_payload: Dict[str, Any], k: int = 4) -> str:
+def _kb_id(i: int) -> str:
+    return f"KB{i:03d}"
+
+
+def retrieve_rag_hits(match_payload: Dict[str, Any], k: int = 4) -> List[Tuple[int, float]]:
     """
-    OpenAI埋め込み + コサイン類似度で上位k件を取り出す。
+    返り値: [(knowledge_index, score), ...]
     """
     _ensure_knowledge_index()
-    assert _knowledge_vecs_norm is not None  # for type checker
+    assert _knowledge_vecs_norm is not None
 
     events = match_payload.get("events", []) or []
-
-    # クエリは「イベント先頭数個」を連結（十分）
     sample_texts = [_build_event_text(ev) for ev in events[:10]]
     query = " ".join(sample_texts) if sample_texts else "フットサル 試合レポート 戦術 まとめ"
 
     qv = _embed_texts([query])
     qv_norm = _l2_normalize(qv)  # (1, D)
 
-    # cosine similarity = dot(normalized, normalized)
     scores = (_knowledge_vecs_norm @ qv_norm[0]).astype(np.float32)  # (N,)
     top_idx = np.argsort(-scores)[:k].tolist()
 
-    hits = [futsal_knowledge[i] for i in top_idx]
-    top_scores = [float(scores[i]) for i in top_idx]
+    hits = [(i, float(scores[i])) for i in top_idx]
 
+    # ---- RAG検索ログ（これが「RAGが動いてる証拠」）----
     logger.debug(f"[RAG] query(head 160)={query[:160]}")
-    logger.debug(f"[RAG] top_idx={top_idx}")
-    logger.debug(f"[RAG] top_scores={top_scores}")
-    logger.debug(f"[RAG] hit_texts={hits}")
+    logger.info("[RAG] hits=" + json.dumps(
+        [{"id": _kb_id(i), "idx": i, "score": s, "text_head": futsal_knowledge[i][:80]} for i, s in hits],
+        ensure_ascii=False
+    ))
 
-    rag_text = "【参照用フットサル知識（RAG）】\n" + "\n".join([f"- {t}" for t in hits])
+    return hits
+
+
+def format_rag_text(hits: List[Tuple[int, float]]) -> str:
+    """
+    モデルに渡すRAG本文（IDつき）
+    ※スコアはモデルに渡さず、ログにだけ出す（モデル出力が汚れない）
+    """
+    lines = []
+    for i, _s in hits:
+        lines.append(f"- [{_kb_id(i)}] {futsal_knowledge[i]}")
+
+    rag_text = (
+        "【参照用フットサル知識（RAG）】\n"
+        "以下は検索で選ばれた知識です。使った知識があれば、レポート末尾に\n"
+        "「参照した知識ID: KBxxx, ...」の形式でIDだけ列挙してください。\n"
+        "（使っていなければ列挙しない）\n\n"
+        + "\n".join(lines)
+    )
     return rag_text
+
+
+def extract_used_kb_ids(text: str) -> List[str]:
+    """
+    出力から KBxxx を抽出してユニーク化
+    """
+    ids = re.findall(r"KB\d{3}", text or "")
+    uniq = sorted(set(ids))
+    return uniq
 
 
 def generate_match_report(match_payload: Dict[str, Any]) -> str:
     messages = build_multimodal_input(match_payload)
 
-    # ---- RAGを「userのinput_text」として追加（形が崩れない）----
-    rag_text = retrieve_rag_text(match_payload, k=4)
-    messages.append(
-        {
-            "role": "user",
-            "content": [{"type": "input_text", "text": rag_text}],
-        }
-    )
+    # ---- RAG 検索 ----
+    hits = retrieve_rag_hits(match_payload, k=4)
+    rag_text = format_rag_text(hits)
 
-    # ---- 送信内容の確認ログ（でかすぎるので先頭だけ）----
+    # ---- RAG を「userのinput_text」として追加（形が崩れない）----
+    messages.append({"role": "user", "content": [{"type": "input_text", "text": rag_text}]})
+
+    # ---- 送信内容の確認ログ（先頭だけ）----
     logger.debug("[send] SYSTEM_PROMPT(head 200)=\n" + (SYSTEM_PROMPT[:200] if SYSTEM_PROMPT else ""))
     logger.debug("[send] messages_count=%d", len(messages))
-    logger.debug("[send] last_user_message(head 300)=\n" + rag_text[:300])
+    logger.debug("[send] rag_text(head 300)=\n" + rag_text[:300])
 
     response = client.responses.create(
-        model=os.getenv("REPORT_MODEL", "o4-mini"),
+        model=REPORT_MODEL,
         input=messages,
     )
 
     out = response.output_text or ""
-    logger.debug("[result] length=%d", len(out))
-    logger.debug("[result] head 400=\n" + out[:400])
+    logger.info(f"[result] request_id={getattr(response, 'id', None)} length={len(out)}")
 
+    # ---- 出力に「KBxxx」が出たか（＝参照痕跡）----
+    used = extract_used_kb_ids(out)
+    logger.info(f"[RAG_USED] ids={used}")
+
+    if used:
+        # どの知識IDだったかをログに復元
+        recovered = []
+        for kb in used:
+            idx = int(kb.replace("KB", ""))
+            if 0 <= idx < len(futsal_knowledge):
+                recovered.append({"id": kb, "text_head": futsal_knowledge[idx][:120]})
+        logger.info("[RAG_USED] texts=" + json.dumps(recovered, ensure_ascii=False))
+
+    logger.debug("[result] head 400=\n" + out[:400])
     return out
