@@ -1,3 +1,4 @@
 fastapi
 uvicorn[standard]
 openai
+faiss-cpu==1.9.0.post1
