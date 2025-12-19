@@ -56,15 +56,11 @@ class ReportResponse(BaseModel):
 app = FastAPI()
 
 # スナップショット保存ディレクトリ
-SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "snapshots"))
+SNAPSHOT_DIR = Path(__file__).resolve().parent / "snapshots"
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-# /snapshots/ 配下を静的ファイルとして公開
-app.mount(
-    "/snapshots",
-    StaticFiles(directory=SNAPSHOT_DIR),
-    name="snapshots",
-)
+# ★これがないと /snapshots/... が404になりやすい
+app.mount("/snapshots", StaticFiles(directory=SNAPSHOT_DIR), name="snapshots")
 
 # ========== 画像アップロード用エンドポイント ==========
 
