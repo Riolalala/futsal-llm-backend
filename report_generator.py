@@ -6,9 +6,7 @@ import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
 # =========================
@@ -31,9 +29,8 @@ SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", "https://futsal-report-api.on
 # =========================
 def load_prompt() -> str:
     """
-    - Renderだとカレントがズレることがあるので、
-      `__file__` 基準で config.json を読むのが安全。
-    - どのファイルを読んだかをログに必ず出す。
+    - Renderだとカレントがズレることがあるので `__file__` 基準で config.json を読む
+    - どのファイルを読んだかをログに必ず出す
     """
     env_path = os.getenv("CONFIG_PATH")  # 任意で差し替え可能
     config_path = Path(env_path) if env_path else Path(__file__).with_name("config.json")
@@ -51,7 +48,6 @@ def load_prompt() -> str:
     if "system_prompt" not in config or not isinstance(config["system_prompt"], str):
         raise ValueError("config.json must contain string field: system_prompt")
 
-    # 更新確認用：mtime と先頭だけ表示
     stat = config_path.stat()
     logger.debug(f"[config] mtime={stat.st_mtime}")
     prompt = config["system_prompt"]
@@ -91,11 +87,46 @@ futsal_knowledge = [
     "アタッキングサードは、ゴールに近い攻撃的エリアで、得点を狙う場所。",
 ]
 
-# embedding / faiss (起動時に作る)
-model = SentenceTransformer("all-MiniLM-L6-v2")
-knowledge_embeddings = model.encode(futsal_knowledge)
-index = faiss.IndexFlatL2(knowledge_embeddings.shape[1])
-index.add(np.array(knowledge_embeddings))
+# =========================
+# OpenAI Embeddings RAG（軽量）
+# =========================
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+_knowledge_vecs: Optional[np.ndarray] = None
+_knowledge_vecs_norm: Optional[np.ndarray] = None
+
+
+def _embed_texts(texts: List[str]) -> np.ndarray:
+    """
+    OpenAI Embeddings を使って埋め込みを取得
+    戻り値: (N, D) の float32 numpy array
+    """
+    resp = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=texts,
+    )
+    vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
+    return vecs
+
+
+def _l2_normalize(mat: np.ndarray) -> np.ndarray:
+    denom = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+    return mat / denom
+
+
+def _ensure_knowledge_index() -> None:
+    """
+    知識ベクトルを一度だけ作ってメモリにキャッシュ
+    """
+    global _knowledge_vecs, _knowledge_vecs_norm
+    if _knowledge_vecs_norm is not None:
+        return
+
+    logger.debug(f"[RAG] building knowledge embeddings: n={len(futsal_knowledge)} model={EMBEDDING_MODEL}")
+    vecs = _embed_texts(futsal_knowledge)
+    _knowledge_vecs = vecs
+    _knowledge_vecs_norm = _l2_normalize(vecs)
+    logger.debug(f"[RAG] knowledge embedding shape={_knowledge_vecs_norm.shape}")
 
 
 # =========================
@@ -110,6 +141,7 @@ def normalize_half(h: Any) -> Optional[str]:
     if s in ["2nd", "second", "h2", "後半", "secondhalf", "2"]:
         return "2nd"
     return None
+
 
 def half_label_jp(norm: Optional[str]) -> str:
     if norm == "1st":
@@ -194,7 +226,8 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
 
     intro_text = (
         "以下にフットサルの試合記録と、各イベントに対応する戦術ボード画像を与えます。\n"
-        "【重要】与えられたイベント以外を推測・創作しないでください。\n\n"
+        "【重要】与えられたイベント以外を推測・創作しないでください。\n"
+        "【重要】後半イベントが未提供なら、後半について一切書かないでください（見出しも不要）。\n\n"
         "【試合概要】\n"
         f"{header_text}\n"
         "【イベント一覧】\n"
@@ -210,9 +243,9 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
 
             snapshot_path = ev.get("snapshotPath")
             if snapshot_path:
-                if snapshot_path == "string" or str(snapshot_path).startswith("data:"):
-                    continue
                 sp = str(snapshot_path)
+                if sp == "string" or sp.startswith("data:"):
+                    continue
                 if sp.startswith("http://") or sp.startswith("https://"):
                     image_url = sp
                 else:
@@ -223,7 +256,7 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
     else:
         user_content.append({"type": "input_text", "text": "前半イベント: 未提供（0件）\n"})
 
-    # ---- 後半 ----（★未提供を明示）
+    # ---- 後半 ----（★未提供を強く明示）
     user_content.append({"type": "input_text", "text": "\n=== 後半イベント ===\n"})
     if second_half_events:
         for idx, ev in enumerate(second_half_events, start=1):
@@ -232,9 +265,9 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
 
             snapshot_path = ev.get("snapshotPath")
             if snapshot_path:
-                if snapshot_path == "string" or str(snapshot_path).startswith("data:"):
-                    continue
                 sp = str(snapshot_path)
+                if sp == "string" or sp.startswith("data:"):
+                    continue
                 if sp.startswith("http://") or sp.startswith("https://"):
                     image_url = sp
                 else:
@@ -243,8 +276,12 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
                     image_url = SNAPSHOT_BASE_URL.rstrip("/") + sp
                 user_content.append({"type": "input_image", "image_url": image_url})
     else:
-        # ★モデルに「後半は書くな」を二重に伝える
-        user_content.append({"type": "input_text", "text": "後半イベント: 未提供（0件）\n※後半について推測して書かない。\n"})
+        user_content.append(
+            {
+                "type": "input_text",
+                "text": "後半イベント: 未提供（0件）\n※後半について推測して書かない。後半の見出しも出さない。\n",
+            }
+        )
 
     messages = [
         {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
@@ -255,21 +292,30 @@ def build_multimodal_input(match_payload: Dict[str, Any]) -> List[Dict[str, Any]
 
 def retrieve_rag_text(match_payload: Dict[str, Any], k: int = 4) -> str:
     """
-    試合内容からクエリを作って、近い知識を k 件取り出し、文字列に整形する。
+    OpenAI埋め込み + コサイン類似度で上位k件を取り出す。
     """
+    _ensure_knowledge_index()
+    assert _knowledge_vecs_norm is not None  # for type checker
+
     events = match_payload.get("events", []) or []
-    # クエリは「試合概要 + 先頭イベント数個」で十分
-    sample_texts = []
-    for ev in events[:10]:
-        sample_texts.append(_build_event_text(ev))
 
+    # クエリは「イベント先頭数個」を連結（十分）
+    sample_texts = [_build_event_text(ev) for ev in events[:10]]
     query = " ".join(sample_texts) if sample_texts else "フットサル 試合レポート 戦術 まとめ"
-    qv = model.encode([query])
-    D, I = index.search(np.array(qv), k=k)
 
-    hits = [futsal_knowledge[i] for i in I[0]]
-    logger.debug(f"[RAG] query(head 120)={query[:120]}")
-    logger.debug(f"[RAG] hit_indices={I[0].tolist()}")
+    qv = _embed_texts([query])
+    qv_norm = _l2_normalize(qv)  # (1, D)
+
+    # cosine similarity = dot(normalized, normalized)
+    scores = (_knowledge_vecs_norm @ qv_norm[0]).astype(np.float32)  # (N,)
+    top_idx = np.argsort(-scores)[:k].tolist()
+
+    hits = [futsal_knowledge[i] for i in top_idx]
+    top_scores = [float(scores[i]) for i in top_idx]
+
+    logger.debug(f"[RAG] query(head 160)={query[:160]}")
+    logger.debug(f"[RAG] top_idx={top_idx}")
+    logger.debug(f"[RAG] top_scores={top_scores}")
     logger.debug(f"[RAG] hit_texts={hits}")
 
     rag_text = "【参照用フットサル知識（RAG）】\n" + "\n".join([f"- {t}" for t in hits])
@@ -279,20 +325,22 @@ def retrieve_rag_text(match_payload: Dict[str, Any], k: int = 4) -> str:
 def generate_match_report(match_payload: Dict[str, Any]) -> str:
     messages = build_multimodal_input(match_payload)
 
-    # ---- RAGを「userのinput_text」として追加（★これが正しい形）----
+    # ---- RAGを「userのinput_text」として追加（形が崩れない）----
     rag_text = retrieve_rag_text(match_payload, k=4)
-    messages.append({
-        "role": "user",
-        "content": [{"type": "input_text", "text": rag_text}],
-    })
+    messages.append(
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": rag_text}],
+        }
+    )
 
     # ---- 送信内容の確認ログ（でかすぎるので先頭だけ）----
-    logger.debug("[send] SYSTEM_PROMPT(head 200)=\n" + SYSTEM_PROMPT[:200])
+    logger.debug("[send] SYSTEM_PROMPT(head 200)=\n" + (SYSTEM_PROMPT[:200] if SYSTEM_PROMPT else ""))
     logger.debug("[send] messages_count=%d", len(messages))
     logger.debug("[send] last_user_message(head 300)=\n" + rag_text[:300])
 
     response = client.responses.create(
-        model="o4-mini",
+        model=os.getenv("REPORT_MODEL", "o4-mini"),
         input=messages,
     )
 
