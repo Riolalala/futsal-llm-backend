@@ -60,7 +60,7 @@ SNAPSHOT_DIR = Path(__file__).resolve().parent / "snapshots"
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ★これがないと /snapshots/... が404になりやすい
-app.mount("/snapshots", StaticFiles(directory=SNAPSHOT_DIR), name="snapshots")
+app.mount("/snapshots", StaticFiles(directory=str(SNAPSHOT_DIR)), name="snapshots")
 
 # ========== 画像アップロード用エンドポイント ==========
 
@@ -75,8 +75,8 @@ async def upload_snapshot(
     クライアントが使う snapshotPath（相対パス）を返す。
     """
     logger.debug(
-        "upload_snapshot: matchId=%s, eventId=%s, filename=%s",
-        matchId, eventId, file.filename,
+        "upload_snapshot: matchId=%s, eventId=%s, filename=%s content_type=%s",
+        matchId, eventId, file.filename, file.content_type,
     )
 
     # 保存先ディレクトリ: snapshots/<matchId>/
@@ -92,7 +92,7 @@ async def upload_snapshot(
 
     # クライアントに返す snapshotPath（LLMPayload.events[].snapshotPath に入れる）
     snapshot_path = f"/snapshots/{matchId}/{filename}"
-    logger.debug("saved snapshot to %s, snapshotPath=%s", save_path, snapshot_path)
+    logger.debug("saved snapshot to %s (bytes=%d), snapshotPath=%s", save_path, len(content), snapshot_path)
 
     return JSONResponse({"snapshotPath": snapshot_path})
 
@@ -106,10 +106,20 @@ async def generate_report_endpoint(payload: LLMPayload):
     日本語の試合レポートを返す。
     """
     logger.debug("generate_report called")
+
     try:
         # Pydantic モデル → dict に変換して LLM へ
         match_dict = payload.model_dump()
-        logger.debug("payload (dict) = %s", match_dict)
+
+        # payload 全体dumpは重いので、サマリだけ
+        evs = match_dict.get("events", []) or []
+        with_sp = sum(1 for e in evs if e.get("snapshotPath"))
+        logger.info("[PAYLOAD] events=%d with_snapshotPath=%d venue=%s",
+                    len(evs), with_sp, match_dict.get("venue"))
+
+        # 必要なら先頭1件だけ確認
+        if evs:
+            logger.debug("[PAYLOAD_HEAD_EVENT] %s", evs[0])
 
         # レポート生成
         report = generate_match_report(match_dict)
