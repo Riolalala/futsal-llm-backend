@@ -1,3 +1,4 @@
+import asyncio
 import os
 import logging
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
@@ -100,38 +101,24 @@ async def upload_snapshot(
 
 @app.post("/generate_report", response_model=ReportResponse)
 async def generate_report_endpoint(payload: LLMPayload):
-    """
-    iOS から LLMPayload（試合記録＋イベント情報）が送られてくる想定。
-    report_generator.generate_match_report() を呼び出して、
-    日本語の試合レポートを返す。
-    """
     logger.debug("generate_report called")
 
     try:
-        # Pydantic モデル → dict に変換して LLM へ
         match_dict = payload.model_dump()
 
-        # payload 全体dumpは重いので、サマリだけ
         evs = match_dict.get("events", []) or []
         with_sp = sum(1 for e in evs if e.get("snapshotPath"))
         logger.info("[PAYLOAD] events=%d with_snapshotPath=%d venue=%s",
                     len(evs), with_sp, match_dict.get("venue"))
 
-        # 必要なら先頭1件だけ確認
-        if evs:
-            logger.debug("[PAYLOAD_HEAD_EVENT] %s", evs[0])
-
-        # レポート生成
-        report = generate_match_report(match_dict)
+        # ✅ ここが重要：同期の重い処理をイベントループ上で回さない
+        report = await asyncio.to_thread(generate_match_report, match_dict)
 
         logger.debug("report generated successfully, length=%d", len(report))
         return ReportResponse(report=report)
 
     except Exception as e:
-        # ★ ここでサーバ側ログにフルのトレースバックを出す
         logger.exception("エラーが発生しました: %s", e)
-
-        # ★ そしてクライアント側にもエラー内容をそのまま返す（デバッグ用）
         raise HTTPException(
             status_code=500,
             detail=f"レポート生成中にエラーが発生しました: {repr(e)}",

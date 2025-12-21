@@ -201,28 +201,25 @@ def resolve_snapshot_url(snapshot_path: str) -> str:
 
 _url_ok_cache: Dict[str, bool] = {}
 
-def url_is_ok(url: str, timeout: float = 3.0) -> bool:
-    """
-    画像URLがOpenAI側から取りに行ける前提の公開URLかを軽くチェックする。
-    HEADは環境依存で落ちることがあるので、GET(Range)で確認する。
-    """
+def url_is_ok(url: str) -> bool:
     try:
-        headers = {"Range": "bytes=0-0"}  # 1バイトだけ要求（対応してなければ200で返る）
+        timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=10.0)
+        headers = {"Range": "bytes=0-0"}  # 1byteだけ
         r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
 
         ct = (r.headers.get("content-type") or "").lower()
-        ok_status = (r.status_code in (200, 206))
+        ok_status = r.status_code in (200, 206)
         ok_type = ("image/" in ct) or url.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
 
         if not (ok_status and ok_type):
-            logger.info(
-                "[URL_CHECK_NG] status=%s ct=%s url=%s",
-                r.status_code, ct, url
-            )
+            logger.info("[URL_CHECK_NG] status=%s ct=%s url=%s", r.status_code, ct, url)
             return False
 
-        logger.debug("[URL_CHECK_OK] status=%s ct=%s url=%s", r.status_code, ct, url)
         return True
+
+    except Exception as e:
+        logger.info("[URL_CHECK_ERR] url=%s err=%r", url, e)
+        return False
 
     except Exception as e:
         logger.info("[URL_CHECK_ERR] url=%s err=%r", url, e)
