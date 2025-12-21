@@ -490,7 +490,10 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
         else:
             logger.exception("[OPENAI] BadRequestError (not image-url): %s", msg)
             raise
-
+    
+    # out を得た直後（used_ids抽出の前）に追加
+    tail = (out or "")[-300:].replace("\n", "\\n")
+    logger.info("[RAW_TAIL] %s", tail)
     used_ids = extract_rag_used_ids(out)
     logger.info("[RESULT] length=%d sec=%.2f", len(out), time.time() - t0)
     logger.info("[RAG-USED] ids=%s", ",".join(used_ids) if used_ids else "none")
