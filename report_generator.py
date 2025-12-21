@@ -201,27 +201,31 @@ def resolve_snapshot_url(snapshot_path: str) -> str:
 
 _url_ok_cache: Dict[str, bool] = {}
 
-def url_is_ok(url: str) -> bool:
-    if url in _url_ok_cache:
-        return _url_ok_cache[url]
-
+def url_is_ok(url: str, timeout: float = 3.0) -> bool:
+    """
+    画像URLがOpenAI側から取りに行ける前提の公開URLかを軽くチェックする。
+    HEADは環境依存で落ちることがあるので、GET(Range)で確認する。
+    """
     try:
-        with httpx.Client(timeout=SNAPSHOT_CHECK_TIMEOUT, follow_redirects=True) as hc:
-            # HEADが通らない環境もあるので、まずHEAD→ダメならGET
-            r = hc.head(url)
-            if r.status_code == 200:
-                _url_ok_cache[url] = True
-                return True
-            if r.status_code in (405, 403):  # HEAD不可など
-                rg = hc.get(url)
-                ok = (rg.status_code == 200)
-                _url_ok_cache[url] = ok
-                return ok
+        headers = {"Range": "bytes=0-0"}  # 1バイトだけ要求（対応してなければ200で返る）
+        r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
 
-            _url_ok_cache[url] = False
+        ct = (r.headers.get("content-type") or "").lower()
+        ok_status = (r.status_code in (200, 206))
+        ok_type = ("image/" in ct) or url.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+
+        if not (ok_status and ok_type):
+            logger.info(
+                "[URL_CHECK_NG] status=%s ct=%s url=%s",
+                r.status_code, ct, url
+            )
             return False
-    except Exception:
-        _url_ok_cache[url] = False
+
+        logger.debug("[URL_CHECK_OK] status=%s ct=%s url=%s", r.status_code, ct, url)
+        return True
+
+    except Exception as e:
+        logger.info("[URL_CHECK_ERR] url=%s err=%r", url, e)
         return False
 
 def _build_event_text(ev: Dict[str, Any]) -> str:
