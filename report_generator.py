@@ -3,7 +3,6 @@
 
 import os
 import re
-import json
 import time
 import logging
 import threading
@@ -26,15 +25,14 @@ logger = logging.getLogger("report_generator")
 client = OpenAI()
 
 SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", "https://futsal-report-api.onrender.com").rstrip("/")
-PROMPT_PATH = os.getenv("PROMPT_PATH", "config.json")
 
 # OpenAI Embedding
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 # レポート生成モデル
 REPORT_MODEL = os.getenv("REPORT_MODEL", "o4-mini")
 
-# 画像の疎通確認タイムアウト（短く）
-SNAPSHOT_CHECK_TIMEOUT = float(os.getenv("SNAPSHOT_CHECK_TIMEOUT", "1.5"))
+# 画像の疎通確認タイムアウト（秒）
+SNAPSHOT_CHECK_TIMEOUT = float(os.getenv("SNAPSHOT_CHECK_TIMEOUT", "3.0"))
 # 1回の生成で送る最大画像数（多すぎると失敗しやすい）
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "12"))
 # RAGで入れる知識数
@@ -47,87 +45,27 @@ SKIP_SNAPSHOT_TYPES = {
 }
 
 # =========================
-# Prompt loader
+# Import prompt / knowledge (py files)
 # =========================
-def load_prompt() -> str:
-    try:
-        with open(PROMPT_PATH, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        prompt = config.get("system_prompt", "")
-        if not prompt.strip():
-            raise ValueError("system_prompt is empty")
-        logger.info("[PROMPT] loaded from %s (len=%d)", PROMPT_PATH, len(prompt))
-        logger.info("[PROMPT_HEAD] %s", prompt.replace("\n", " ")[:180])
-        return prompt
-    except Exception as e:
-        logger.exception("[PROMPT] failed to load %s: %s", PROMPT_PATH, e)
-        # ここで落とすより、最低限のプロンプトで動かす
-        return "あなたはフットサルの試合レポートを書くスポーツライターです。"
+try:
+    # package 配下でも動くように相対importを優先
+    from .prompt_config import system_prompt as SYSTEM_PROMPT_BASE
+    from .prompt_config import safe_append as SYSTEM_PROMPT_SAFE_APPEND
+    from .futsal_knowledge import futsal_knowledge
+except Exception:
+    from prompt_config import system_prompt as SYSTEM_PROMPT_BASE
+    from prompt_config import safe_append as SYSTEM_PROMPT_SAFE_APPEND
+    from futsal_knowledge import futsal_knowledge
 
-SYSTEM_PROMPT = load_prompt()
+SYSTEM_PROMPT = (SYSTEM_PROMPT_BASE or "").strip() or "あなたはフットサルの試合レポートを書くスポーツライターです。"
+SYSTEM_PROMPT_SAFE_APPEND = (SYSTEM_PROMPT_SAFE_APPEND or "").strip()
 
-# 追加の“安全装置”を system に足す（後半創作防止 & RAG使用ログ用）
-# ★ A修正: <rag_used> → <RAG_USED> に統一
-SYSTEM_PROMPT_SAFE_APPEND = """
-【重要】
-- 後半のイベント（2nd）が与えられていない場合、後半について推測・創作しないでください。
-- half が不明なイベント（unknown）がある場合、それを後半扱いにしないでください（半分不明として扱う）。
-- 出力の最後に次を必ず付けてください（本文とは別枠）：
-<RAG_USED>KB001,KB002</RAG_USED>
-（参照しなかった場合は <RAG_USED>none</RAG_USED>）
-"""
+logger.info("[PROMPT] loaded from prompt_config.py (len=%d)", len(SYSTEM_PROMPT))
+logger.info("[PROMPT_HEAD] %s", SYSTEM_PROMPT.replace("\n", " ")[:180])
 
 # =========================
 # Knowledge Base (KBxxx)
 # =========================
-# ※短い例：あなたの futsal_knowledge を KB化したものをここに置く
-# 既存のリストをそのまま使ってOK（IDは自動で付ける）
-futsal_knowledge: List[str] = [
-    # 基本ルール
-    "フットサルは通常、2×20分のハーフで行われ、インターバルは10分である。",
-    "フットサルでは、サッカーと異なり、オフサイドがない。",
-    "フットサルのコートはサッカーよりも小さく、サイドラインが短い。",
-    "フットサルでは、1チーム5人（ゴールキーパー1人、フィールドプレイヤー4人）で構成される。",
-    "フットサルで使われるボールはサッカーよりも小さく、重さが異なる。",
-    "フットサルの試合でファウルが累積され、5回を超えると相手チームにフリーキックが与えられる。",
-
-    # 戦術用語（※文章は長くてもOK）
-    "4-0フォーメーション（クワトロ）は、4人がフラットに広がりパス回しで崩す攻撃的配置。相手の守備を横に揺さぶり、アイソレーションを作りやすい。",
-    "3-1フォーメーション（低め）は、3人が後方で安定し、1人（ピヴォ）を起点に前線で収める。守備は安定しやすく、攻撃はピヴォ当てから展開する。",
-    "2-2フォーメーション（ボックス型）は、2人守備＋2人攻撃の近い距離で連動しやすい。縦関係が作りやすく、中央を使った崩しやカウンターにも移りやすい。",
-    "1-3フォーメーション（高め）は、前線でプレッシャーをかけやすく攻撃枚数を確保しやすいが、背後のリスク管理が重要。",
-
-    "守備戦術にはゾーンディフェンス、マンツーマンディフェンス、ハイプレスなどがある。",
-    "攻撃戦術にはポゼッション重視、カウンターアタック、ウィング攻撃、セットプレイがある。",
-    "カウンターアタックは、相手の攻撃から素早く攻撃に転じる戦術で、速いプレイが求められる。",
-    "ポゼッションプレイはボール保持を重視し、選手同士のパス回しで相手を引きつけてスペースを作り出す。",
-
-    # 特定プレー
-    "カットインは、サイド攻撃選手がサイドラインから中央に切れ込んで攻撃を仕掛ける動き。",
-    "キックインは、ボールがサイドラインを越えた場合に、足を使ってボールを再投入するプレイ。",
-    "スクリーンは、攻撃側選手がディフェンダーを遮るように体でブロックし、味方のフリーを作る。",
-    "チョンドン（キックインからの短いパスでシュートを試みる）は、速攻を意識したキックイン戦術。",
-    "デスマルケは、マークを外して受け直し、パスコースやシュートコースを作る動き。",
-    "パワープレーは、GKをフィールドプレイヤー化して数的優位を作る戦術。",
-    "ハーフは、自陣の半分で守備を固め、コンパクトにラインを保つ戦術。",
-
-    # エリア用語
-    "アイソレーション（孤立）は、1対1を作って個で崩す状況づくり。",
-    "ディフェンシブサードはゴールに近い守備的エリア。",
-    "ミドルサードは中央の攻守バランスが重要なエリア。",
-    "アタッキングサードはゴールに近い攻撃的エリア。",
-
-    # ポジション
-    "ピヴォは攻撃の中心となる選手で、前線で収めて起点になる。",
-    "アラはサイドを担当して攻撃を展開する。",
-    "フィクソは守備の中心で、ビルドアップにも関与する。",
-    "ゴールキーパーは守備だけでなく、ビルドアップの起点としても重要。",
-
-    # セットプレイ
-    "フリーキックやコーナーのセットプレイでは、ショートやダイレクトを使い分けて守備のズレを作る。",
-    "ゴールキック等では安全な前進（保持）と、一気の前進（裏）を状況で選ぶ。",
-]
-
 KB_ITEMS: List[Dict[str, str]] = [
     {"id": f"KB{idx:03d}", "text": txt} for idx, txt in enumerate(futsal_knowledge, start=1)
 ]
@@ -147,12 +85,10 @@ def _l2norm(vec: List[float]) -> List[float]:
     return [x * inv for x in vec]
 
 def _dot(a: List[float], b: List[float]) -> float:
-    # 同じ次元前提
     return sum(x * y for x, y in zip(a, b))
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
     resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
-    # OpenAI python: resp.data[i].embedding
     return [d.embedding for d in resp.data]
 
 def ensure_kb_index() -> None:
@@ -185,7 +121,6 @@ def rag_search(query: str, top_k: int = 4) -> List[Tuple[str, float, str]]:
 # =========================
 def normalize_half(raw: Any) -> Optional[str]:
     """
-    Swift側で正規化しても、サーバ側でも保険で吸収する。
     返り値は "1st"/"2nd"/None/その他
     """
     if raw is None:
@@ -213,54 +148,73 @@ def should_attach_snapshot(ev: Dict[str, Any]) -> bool:
     ev_type = (ev.get("type") or "").strip()
     if ev_type in SKIP_SNAPSHOT_TYPES:
         return False
-    # snapshotPath 自体がないなら不可
     sp = ev.get("snapshotPath")
     if not sp or str(sp).strip() == "" or sp == "string":
         return False
-    # data: は送らない（巨大化しやすい）
     if str(sp).startswith("data:"):
         return False
     return True
 
 def resolve_snapshot_url(snapshot_path: str) -> str:
-    # すでにURLならそのまま
     if snapshot_path.startswith("http://") or snapshot_path.startswith("https://"):
         return snapshot_path
-    # "/snapshots/..." or "snapshots/..." を許容
     if not snapshot_path.startswith("/"):
         snapshot_path = "/" + snapshot_path
     return SNAPSHOT_BASE_URL + snapshot_path
 
-_url_ok_cache: Dict[str, bool] = {}
+# URLチェックの簡易キャッシュ（短時間の同一URLチェックを減らす）
+_url_ok_cache: Dict[str, Tuple[bool, float]] = {}  # url -> (ok, timestamp)
 
 def url_is_ok(url: str) -> bool:
-    try:
-        timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=10.0)
-        headers = {"Range": "bytes=0-0"}  # 1byteだけ
-        r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+    now = time.time()
+    cached = _url_ok_cache.get(url)
+    if cached:
+        ok, ts = cached
+        # OKは5分、NGは30秒だけキャッシュ
+        ttl = 300.0 if ok else 30.0
+        if now - ts < ttl:
+            return ok
 
+    headers = {"Range": "bytes=0-0"}  # 1byteだけ
+    timeout_fast = httpx.Timeout(connect=SNAPSHOT_CHECK_TIMEOUT, read=SNAPSHOT_CHECK_TIMEOUT, write=SNAPSHOT_CHECK_TIMEOUT, pool=SNAPSHOT_CHECK_TIMEOUT)
+    timeout_slow = httpx.Timeout(connect=max(5.0, SNAPSHOT_CHECK_TIMEOUT), read=max(10.0, SNAPSHOT_CHECK_TIMEOUT), write=max(10.0, SNAPSHOT_CHECK_TIMEOUT), pool=max(10.0, SNAPSHOT_CHECK_TIMEOUT))
+
+    def _try(timeout: httpx.Timeout) -> bool:
+        r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
         ct = (r.headers.get("content-type") or "").lower()
         ok_status = r.status_code in (200, 206)
         ok_type = ("image/" in ct) or url.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
-
         if not (ok_status and ok_type):
             logger.info("[URL_CHECK_NG] status=%s ct=%s url=%s", r.status_code, ct, url)
             return False
-
         return True
 
+    try:
+        ok = _try(timeout_fast)
     except Exception as e:
-        logger.info("[URL_CHECK_ERR] url=%s err=%r", url, e)
-        return False
+        logger.info("[URL_CHECK_ERR] url=%s err=%r (fast)", url, e)
+        # Renderのコールドスタート等を想定し、1回だけ長めでリトライ
+        try:
+            ok = _try(timeout_slow)
+        except Exception as e2:
+            logger.info("[URL_CHECK_ERR] url=%s err=%r (slow)", url, e2)
+            ok = False
 
-    except Exception as e:
-        logger.info("[URL_CHECK_ERR] url=%s err=%r", url, e)
-        return False
+    _url_ok_cache[url] = (ok, now)
+    return ok
 
 def _build_event_text(ev: Dict[str, Any]) -> str:
-    half = normalize_half(ev.get("half")) or ""
+    h = normalize_half(ev.get("half"))
+    if h == "1st":
+        half_label = "前半"
+    elif h == "2nd":
+        half_label = "後半"
+    else:
+        half_label = "half不明（要修正）"
+
     minute_raw = ev.get("minute")
     second_raw = ev.get("second")
+
     team_side = ev.get("teamSide")
     main_no = ev.get("mainPlayerNumber")
     assist_no = ev.get("assistPlayerNumber")
@@ -279,11 +233,11 @@ def _build_event_text(ev: Dict[str, Any]) -> str:
         second = None
 
     if minute is not None and second is not None:
-        time_str = f"{half} {minute:02d}:{second:02d}" if half else f"{minute:02d}:{second:02d}"
-    elif half:
-        time_str = half
+        time_str = f"{half_label} {minute:02d}:{second:02d}"
+    elif minute is not None:
+        time_str = f"{half_label} {minute:02d}:??"
     else:
-        time_str = "時間不明"
+        time_str = f"{half_label} 時間不明"
 
     if team_side == "home":
         side_str = "ホームチーム"
@@ -319,7 +273,11 @@ def event_priority(ev: Dict[str, Any]) -> int:
 # =========================
 # Build messages
 # =========================
-def build_messages(match_payload: Dict[str, Any], rag_hits: List[Tuple[str, float, str]], allow_images: bool = True) -> List[Dict[str, Any]]:
+def build_messages(
+    match_payload: Dict[str, Any],
+    rag_hits: List[Tuple[str, float, str]],
+    allow_images: bool = True
+) -> List[Dict[str, Any]]:
     venue = match_payload.get("venue") or "会場不明"
     tournament = match_payload.get("tournament") or "大会名不明"
     round_desc = match_payload.get("round") or "ラウンド不明"
@@ -339,10 +297,12 @@ def build_messages(match_payload: Dict[str, Any], rag_hits: List[Tuple[str, floa
     )
 
     events = match_payload.get("events", []) or []
+
     # half 正規化して分類
-    first_half = []
-    second_half = []
-    unknown_half = []
+    first_half: List[Dict[str, Any]] = []
+    second_half: List[Dict[str, Any]] = []
+    unknown_half: List[Dict[str, Any]] = []
+
     for ev in events:
         h = normalize_half(ev.get("half"))
         if h == "1st":
@@ -368,7 +328,7 @@ def build_messages(match_payload: Dict[str, Any], rag_hits: List[Tuple[str, floa
         "【試合概要】\n"
         f"{header_text}\n"
         "【イベント一覧】\n"
-        "各イベントは「前半/後半/半不明」に分けて提示します。\n"
+        "各イベントは「前半/後半/half不明」に分けて提示します。\n"
     )
     user_content.append({"type": "input_text", "text": intro_text})
 
@@ -400,8 +360,6 @@ def build_messages(match_payload: Dict[str, Any], rag_hits: List[Tuple[str, floa
         user_content.append({"type": "input_text", "text": "\n--- 前半 (1st) ---\n"})
         for i, ev in enumerate(first_half, start=1):
             user_content.append({"type": "input_text", "text": f"\n[1st-{i}] {_build_event_text(ev)}"})
-
-            # このイベントが chosen_images に入ってるなら画像添付
             if allow_images:
                 sp = ev.get("snapshotPath")
                 if sp:
@@ -421,13 +379,13 @@ def build_messages(match_payload: Dict[str, Any], rag_hits: List[Tuple[str, floa
                     if any(x["url"] == url for x in chosen_images):
                         user_content.append({"type": "input_image", "image_url": url})
     else:
-        # ★ これが「後半創作」を止める決定打（user側にも明示）
+        # 後半創作防止（user側にも明示）
         user_content.append({"type": "input_text", "text": "\n【後半イベント】未提供（2ndは0件）。後半について推測で書かないでください。\n"})
 
-    # 半不明
+    # half不明
     if unknown_half:
         user_content.append({"type": "input_text", "text": "\n--- half不明 (unknown) ---\n"})
-        user_content.append({"type": "input_text", "text": "※ これらは前半/後半が不明です。後半扱いにせず「半不明」として扱ってください。\n"})
+        user_content.append({"type": "input_text", "text": "※ これらは前半/後半が不明です。後半扱いにせず『half不明（要修正）』として扱ってください。\n"})
         for i, ev in enumerate(unknown_half, start=1):
             user_content.append({"type": "input_text", "text": f"\n[UNK-{i}] {_build_event_text(ev)}"})
             if allow_images:
@@ -441,7 +399,7 @@ def build_messages(match_payload: Dict[str, Any], rag_hits: List[Tuple[str, floa
         {
             "role": "system",
             "content": [
-                {"type": "input_text", "text": SYSTEM_PROMPT + "\n" + SYSTEM_PROMPT_SAFE_APPEND}
+                {"type": "input_text", "text": SYSTEM_PROMPT + ("\n\n" + SYSTEM_PROMPT_SAFE_APPEND if SYSTEM_PROMPT_SAFE_APPEND else "")}
             ],
         },
         {
@@ -455,26 +413,22 @@ def build_messages(match_payload: Dict[str, Any], rag_hits: List[Tuple[str, floa
 # =========================
 # RAG used extraction
 # =========================
-# ★ A修正: <RAG_USED> / <rag_used> どちらでも拾えるように（大小文字・空白も許容）
 _RAG_USED_RE = re.compile(r"<\s*rag_used\s*>(.*?)</\s*rag_used\s*>", re.DOTALL | re.IGNORECASE)
 
 def extract_rag_used_ids(text: str) -> List[str]:
     m = _RAG_USED_RE.search(text or "")
     if not m:
-        # フォールバック：KBxxx を拾う
         ids = sorted(set(re.findall(r"KB\d{3}", text or "")))
         return ids
     inside = m.group(1).strip()
     if inside.lower() == "none" or inside == "":
         return []
     ids = [x.strip() for x in inside.split(",") if x.strip()]
-    # KBフォーマットだけに絞る
     return [x for x in ids if re.fullmatch(r"KB\d{3}", x)]
 
 def strip_rag_used_footer(text: str) -> str:
     if not text:
         return ""
-    # ★ A修正: 大小文字・空白を許容して削除
     return re.sub(r"\s*<\s*rag_used\s*>.*?</\s*rag_used\s*>\s*", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
 
 # =========================
@@ -487,8 +441,6 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
     """
     t0 = time.time()
 
-    # RAG query は「試合の特徴」を含むように作る（固定文はやめる）
-    # ただし長すぎるとembeddingコストが増えるのでほどほどに
     venue = match_payload.get("venue") or ""
     tournament = match_payload.get("tournament") or ""
     events = match_payload.get("events", []) or []
@@ -510,9 +462,8 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
         )
         out = resp.output_text or ""
     except BadRequestError as e:
-        # 画像URL timeout/invalid_value のときは「画像なし」でリトライ
         msg = str(e)
-        if "Timeout while downloading" in msg or "\"param\": 'url'" in msg or "param" in msg and "url" in msg:
+        if "Timeout while downloading" in msg or ("param" in msg and "url" in msg):
             logger.warning("[OPENAI] image download failed -> retry without images: %s", msg)
             messages2 = build_messages(match_payload, rag_hits, allow_images=False)
             resp2 = client.responses.create(
@@ -523,14 +474,14 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
         else:
             logger.exception("[OPENAI] BadRequestError (not image-url): %s", msg)
             raise
-    
-    # out を得た直後（used_ids抽出の前）に追加
+
     tail = (out or "")[-300:].replace("\n", "\\n")
     logger.info("[RAW_TAIL] %s", tail)
+
     used_ids = extract_rag_used_ids(out)
     logger.info("[RESULT] length=%d sec=%.2f", len(out), time.time() - t0)
     logger.info("[RAG-USED] ids=%s", ",".join(used_ids) if used_ids else "none")
-    # 使われたKBの本文もログに出す
+
     used_set = set(used_ids)
     for item in KB_ITEMS:
         if item["id"] in used_set:
