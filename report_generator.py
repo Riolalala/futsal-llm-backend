@@ -67,13 +67,14 @@ def load_prompt() -> str:
 SYSTEM_PROMPT = load_prompt()
 
 # 追加の“安全装置”を system に足す（後半創作防止 & RAG使用ログ用）
+# ★ A修正: <rag_used> → <RAG_USED> に統一
 SYSTEM_PROMPT_SAFE_APPEND = """
 【重要】
 - 後半のイベント（2nd）が与えられていない場合、後半について推測・創作しないでください。
 - half が不明なイベント（unknown）がある場合、それを後半扱いにしないでください（半分不明として扱う）。
 - 出力の最後に次を必ず付けてください（本文とは別枠）：
-<rag_used>KB001,KB002</rag_used>
-（参照しなかった場合は <rag_used>none</rag_used>）
+<RAG_USED>KB001,KB002</RAG_USED>
+（参照しなかった場合は <RAG_USED>none</RAG_USED>）
 """
 
 # =========================
@@ -338,7 +339,7 @@ def build_messages(match_payload: Dict[str, Any], rag_hits: List[Tuple[str, floa
     )
     user_content.append({"type": "input_text", "text": intro_text})
 
-    # RAG を user に注入（本文にタグは出さないが、末尾に <rag_used> を出させる）
+    # RAG を user に注入
     rag_text_lines = []
     for kid, score, ktext in rag_hits:
         rag_text_lines.append(f"{kid} score={score:.3f} text={ktext}")
@@ -421,7 +422,8 @@ def build_messages(match_payload: Dict[str, Any], rag_hits: List[Tuple[str, floa
 # =========================
 # RAG used extraction
 # =========================
-_RAG_USED_RE = re.compile(r"<rag_used>(.*?)</rag_used>", re.DOTALL)
+# ★ A修正: <RAG_USED> / <rag_used> どちらでも拾えるように（大小文字・空白も許容）
+_RAG_USED_RE = re.compile(r"<\s*rag_used\s*>(.*?)</\s*rag_used\s*>", re.DOTALL | re.IGNORECASE)
 
 def extract_rag_used_ids(text: str) -> List[str]:
     m = _RAG_USED_RE.search(text or "")
@@ -439,7 +441,8 @@ def extract_rag_used_ids(text: str) -> List[str]:
 def strip_rag_used_footer(text: str) -> str:
     if not text:
         return ""
-    return re.sub(r"\s*<rag_used>.*?</rag_used>\s*", "", text, flags=re.DOTALL).strip()
+    # ★ A修正: 大小文字・空白を許容して削除
+    return re.sub(r"\s*<\s*rag_used\s*>.*?</\s*rag_used\s*>\s*", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
 
 # =========================
 # Main API function
@@ -497,5 +500,5 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
         if item["id"] in used_set:
             logger.info("[RAG-USED] %s text=%s", item["id"], (item["text"][:120] + "…") if len(item["text"]) > 120 else item["text"])
 
-    # ユーザーに返す本文からは <rag_used> を消す
+    # ユーザーに返す本文からは <RAG_USED> を消す
     return strip_rag_used_footer(out)
