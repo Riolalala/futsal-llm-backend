@@ -30,6 +30,8 @@ SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", "https://futsal-report-api.on
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 # レポート生成モデル
 REPORT_MODEL = os.getenv("REPORT_MODEL", "o4-mini")
+#LLM Temperature
+REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "0"))
 
 # 画像の疎通確認タイムアウト（秒）
 SNAPSHOT_CHECK_TIMEOUT = float(os.getenv("SNAPSHOT_CHECK_TIMEOUT", "3.0"))
@@ -459,6 +461,7 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
         resp = client.responses.create(
             model=REPORT_MODEL,
             input=messages,
+            temperature=REPORT_TEMPERATURE,
         )
         out = resp.output_text or ""
     except BadRequestError as e:
@@ -469,6 +472,7 @@ def generate_match_report(match_payload: Dict[str, Any]) -> str:
             resp2 = client.responses.create(
                 model=REPORT_MODEL,
                 input=messages2,
+                temperature=REPORT_TEMPERATURE,
             )
             out = resp2.output_text or ""
         else:
