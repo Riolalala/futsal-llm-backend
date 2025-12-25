@@ -36,7 +36,7 @@ REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "0"))
 # 画像の疎通確認タイムアウト（秒）
 SNAPSHOT_CHECK_TIMEOUT = float(os.getenv("SNAPSHOT_CHECK_TIMEOUT", "3.0"))
 # 1回の生成で送る最大画像数（多すぎると失敗しやすい）
-MAX_IMAGES = int(os.getenv("MAX_IMAGES", "12"))
+MAX_IMAGES = int(os.getenv("MAX_IMAGES", "24"))
 # RAGで入れる知識数
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 
