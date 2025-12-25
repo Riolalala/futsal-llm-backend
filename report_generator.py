@@ -29,7 +29,7 @@ SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", "https://futsal-report-api.on
 # OpenAI Embedding
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 # レポート生成モデル
-REPORT_MODEL = os.getenv("REPORT_MODEL", "o4-mini")
+REPORT_MODEL = os.getenv("REPORT_MODEL", "gpt-4o")
 #LLM Temperature
 REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "0"))
 
