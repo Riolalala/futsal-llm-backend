@@ -38,7 +38,7 @@ SNAPSHOT_CHECK_TIMEOUT = float(os.getenv("SNAPSHOT_CHECK_TIMEOUT", "3.0"))
 # 1回の生成で送る最大画像数（多すぎると失敗しやすい）
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "24"))
 # RAGで入れる知識数
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
 
 # 「このtypeは画像いらない」方針（必要なら追加）
 SKIP_SNAPSHOT_TYPES = {
