@@ -11,6 +11,7 @@ import logging
 import threading
 from typing import Dict, Any, List, Optional, Tuple, DefaultDict
 from collections import defaultdict
+from pathlib import Path
 
 import httpx
 from openai import OpenAI
@@ -27,7 +28,7 @@ except Exception:
     HAVE_MPL = False
 
 # =========================
-# Logging (Render logs に出る)
+# Logging
 # =========================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -38,19 +39,27 @@ logger = logging.getLogger("report_generator")
 
 client = OpenAI()
 
-SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", "https://futsal-report-api.onrender.com").rstrip("/")
+# 画像やレポート png を配信するベースURL（Render等の公開URL）
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://futsal-report-api.onrender.com").rstrip("/")
+
+# snapshots は同じホスト運用なら PUBLIC_BASE_URL でOK
+SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
 
 # OpenAI Embedding
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+
 # レポート生成モデル
 REPORT_MODEL = os.getenv("REPORT_MODEL", "gpt-4o")
-# LLM Temperature
+
+# LLM Temperature（非対応モデルもあるので後で自動fallback）
 REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "0"))
 
 # 画像の疎通確認タイムアウト（秒）
 SNAPSHOT_CHECK_TIMEOUT = float(os.getenv("SNAPSHOT_CHECK_TIMEOUT", "3.0"))
-# 1回の生成で送る最大画像数（多すぎると失敗しやすい）
+
+# 1回の生成で送る最大画像数
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "24"))
+
 # RAGで入れる知識数
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
 
@@ -64,8 +73,11 @@ SKIP_SNAPSHOT_TYPES = {
     "timeout", "time_out", "timeOut", "タイムアウト",
 }
 
+logger.info("[CHARTS] ENABLE_CHARTS=%s HAVE_MPL=%s", ENABLE_CHARTS, HAVE_MPL)
+logger.info("[MODEL] REPORT_MODEL=%s REPORT_TEMPERATURE=%s", REPORT_MODEL, REPORT_TEMPERATURE)
+
 # =========================
-# Import prompt / knowledge (py files)
+# Import prompt / knowledge
 # =========================
 try:
     from .prompt_config import system_prompt as SYSTEM_PROMPT_BASE
@@ -80,7 +92,6 @@ SYSTEM_PROMPT = (SYSTEM_PROMPT_BASE or "").strip() or "あなたはフットサ�
 SYSTEM_PROMPT_SAFE_APPEND = (SYSTEM_PROMPT_SAFE_APPEND or "").strip()
 
 logger.info("[PROMPT] loaded from prompt_config.py (len=%d)", len(SYSTEM_PROMPT))
-logger.info("[PROMPT_HEAD] %s", SYSTEM_PROMPT.replace("\n", " ")[:180])
 
 # =========================
 # Knowledge Base (KBxxx)
@@ -138,6 +149,9 @@ def rag_search(query: str, top_k: int = 4) -> List[Tuple[str, float, str]]:
 # =========================
 # Event helpers
 # =========================
+_HALF_RE_1 = re.compile(r"(?:^|\b)(1|1st|1h|first)(?:\b|$)", re.IGNORECASE)
+_HALF_RE_2 = re.compile(r"(?:^|\b)(2|2nd|2h|second)(?:\b|$)", re.IGNORECASE)
+
 def normalize_half(raw: Any) -> Optional[str]:
     """
     返り値は "1st"/"2nd"/None/その他
@@ -159,16 +173,22 @@ def normalize_half(raw: Any) -> Optional[str]:
 
     s_lower = s.lower()
 
-    # string number
-    if s_lower in ("1", "1st", "1h", "first", "firsthalf", "前半", "前"):
+    # 日本語が混ざるケース
+    if "前半" in s or s_lower in ("前",):
         return "1st"
-    if s_lower in ("2", "2nd", "2h", "second", "secondhalf", "後半", "後"):
+    if "後半" in s or s_lower in ("後",):
         return "2nd"
 
-    # extra forms
-    if s in ("1st", "1h", "前半", "前", "first", "firsthalf") or s_lower in ("1st", "1h", "first", "firsthalf"):
+    # よくある表記揺れ（2ndHalf, first_half など）
+    if _HALF_RE_1.search(s_lower) or "firsthalf" in s_lower or "first_half" in s_lower:
         return "1st"
-    if s in ("2nd", "2h", "後半", "後", "second", "secondhalf") or s_lower in ("2nd", "2h", "second", "secondhalf"):
+    if _HALF_RE_2.search(s_lower) or "secondhalf" in s_lower or "second_half" in s_lower:
+        return "2nd"
+
+    # string number
+    if s_lower in ("1", "1st", "1h", "first", "firsthalf", "first_half"):
+        return "1st"
+    if s_lower in ("2", "2nd", "2h", "second", "secondhalf", "second_half"):
         return "2nd"
 
     return s  # unknown扱い
@@ -191,7 +211,7 @@ def resolve_snapshot_url(snapshot_path: str) -> str:
         snapshot_path = "/" + snapshot_path
     return SNAPSHOT_BASE_URL + snapshot_path
 
-# URLチェックの簡易キャッシュ（短時間の同一URLチェックを減らす）
+# URLチェックの簡易キャッシュ
 _url_ok_cache: Dict[str, Tuple[bool, float]] = {}  # url -> (ok, timestamp)
 
 def url_is_ok(url: str) -> bool:
@@ -252,7 +272,6 @@ def _player_name(team_side: Any, number: Optional[int], home_map: Dict[int, str]
         return home_map.get(number, "")
     if team_side == "away":
         return away_map.get(number, "")
-    # team不明なら両方から探す
     return home_map.get(number, "") or away_map.get(number, "")
 
 def _is_goal(ev_type: str) -> bool:
@@ -308,7 +327,6 @@ def _build_event_text(
     else:
         time_str = f"{half_label} 時間不明"
 
-    # player strings with names
     main_name = _player_name(team_side, main_no, home_map, away_map)
     assist_name = _player_name(team_side, assist_no, home_map, away_map)
 
@@ -319,7 +337,6 @@ def _build_event_text(
 
     players_str = ""
     if _is_sub(ev_type):
-        # OUT=main / IN=assist の想定
         out_s = fmt(main_no, main_name)
         in_s = fmt(assist_no, assist_name)
         parts = []
@@ -338,7 +355,6 @@ def _build_event_text(
         elif assist:
             players_str = f"A: {assist}"
     else:
-        # shot/foul etc
         p = fmt(main_no, main_name)
         a = fmt(assist_no, assist_name)
         if p and a:
@@ -349,7 +365,6 @@ def _build_event_text(
             players_str = f"関与: {a}"
 
     note_str = f" メモ: {note}" if note else ""
-    # ✅ “ホームチーム/アウェイチーム”は禁止 → チーム名
     body = f"[{time_str}] {team_str} の {ev_type}。"
     if players_str:
         body += f" {players_str}。"
@@ -358,9 +373,6 @@ def _build_event_text(
     return body.strip()
 
 def event_priority(ev: Dict[str, Any]) -> int:
-    """
-    画像を送る優先度（大きいほど優先）
-    """
     t = (ev.get("type") or "").lower()
     if "goal" in t or "ゴール" in (ev.get("type") or ""):
         return 100
@@ -373,13 +385,9 @@ def event_priority(ev: Dict[str, Any]) -> int:
     return 10
 
 # =========================
-# STATS builder (facts are computed here; LLM must not recalc)
+# STATS builder
 # =========================
 def _roster_map(team: Dict[str, Any]) -> Dict[int, str]:
-    """
-    payload の players から {number: name} を作る（無くても落ちない）
-    想定: players=[{"number": 10, "name": "xxx"}, ...]
-    """
     m: Dict[int, str] = {}
     players = team.get("players") or []
     if not isinstance(players, list):
@@ -412,7 +420,6 @@ def build_stats(match_payload: Dict[str, Any]) -> Dict[str, Any]:
 
     half_event_counts = {"first": 0, "second": 0, "unknown": 0}
 
-    # team/half counters for key categories
     cats = ["goals", "shots", "fouls", "subs", "timeouts", "others"]
     def init_counter() -> Dict[str, int]:
         return {c: 0 for c in cats}
@@ -423,7 +430,6 @@ def build_stats(match_payload: Dict[str, Any]) -> Dict[str, Any]:
         "unknown": {home_name: init_counter(), away_name: init_counter(), "チーム不明": init_counter()},
     }
 
-    # player stats
     player_stats: DefaultDict[str, DefaultDict[str, int]] = defaultdict(lambda: defaultdict(int))
 
     goals_timeline: List[Dict[str, Any]] = []
@@ -436,6 +442,13 @@ def build_stats(match_payload: Dict[str, Any]) -> Dict[str, Any]:
         if h == "2nd":
             return "second"
         return "unknown"
+
+    def pkey(team_side_: Any, no: Optional[int]) -> Optional[str]:
+        if no is None:
+            return None
+        team_label = _team_name(team_side_, home_name, away_name)
+        pname = _player_name(team_side_, no, home_map, away_map)
+        return f"{team_label}|#{no} {pname}".strip()
 
     for ev in events:
         hb = half_bucket(ev)
@@ -452,7 +465,6 @@ def build_stats(match_payload: Dict[str, Any]) -> Dict[str, Any]:
         main_no = _safe_int(ev.get("mainPlayerNumber"))
         assist_no = _safe_int(ev.get("assistPlayerNumber"))
 
-        # categorize
         if _is_goal(ev_type):
             team_half_counts[hb][tname]["goals"] += 1
         elif _is_shot(ev_type):
@@ -465,14 +477,6 @@ def build_stats(match_payload: Dict[str, Any]) -> Dict[str, Any]:
             team_half_counts[hb][tname]["timeouts"] += 1
         else:
             team_half_counts[hb][tname]["others"] += 1
-
-        # player label
-        def pkey(team_side_: Any, no: Optional[int]) -> Optional[str]:
-            if no is None:
-                return None
-            team_label = _team_name(team_side_, home_name, away_name)
-            pname = _player_name(team_side_, no, home_map, away_map)
-            return f"{team_label}|#{no} {pname}".strip()
 
         if _is_goal(ev_type):
             if tname != "チーム不明":
@@ -526,7 +530,6 @@ def build_stats(match_payload: Dict[str, Any]) -> Dict[str, Any]:
                 "note": ev.get("note") or "",
             })
 
-    # score from known-team goals only
     def score(hb: str) -> Tuple[int, int]:
         hg = sum(1 for g in goals_timeline if g["half"] == hb and g["team"] == home_name)
         ag = sum(1 for g in goals_timeline if g["half"] == hb and g["team"] == away_name)
@@ -536,7 +539,6 @@ def build_stats(match_payload: Dict[str, Any]) -> Dict[str, Any]:
     h2, a2 = score("second")
     ht, at = h1 + h2, a1 + a2
 
-    # player rows
     rows: List[Dict[str, Any]] = []
     for k, d in player_stats.items():
         team, player = k.split("|", 1) if "|" in k else ("チーム不明", k)
@@ -557,6 +559,7 @@ def build_stats(match_payload: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "match": {
+            "matchId": match_payload.get("matchId") or "",
             "home_team": home_name,
             "away_team": away_name,
             "tournament": match_payload.get("tournament") or "",
@@ -564,61 +567,155 @@ def build_stats(match_payload: Dict[str, Any]) -> Dict[str, Any]:
             "venue": match_payload.get("venue") or "",
             "kickoffISO8601": match_payload.get("kickoffISO8601") or "",
         },
-        "half_event_counts": half_event_counts,  # first/second/unknown event counts
+        "half_event_counts": half_event_counts,
         "score": {
             "first": {"home": h1, "away": a1},
             "second": {"home": h2, "away": a2},
             "total": {"home": ht, "away": at},
         },
-        "team_half_counts": team_half_counts,   # per half per team: goals/shots/fouls/subs/timeouts/others
+        "team_half_counts": team_half_counts,
         "goals_timeline": goals_timeline,
         "misc_timeline": misc_timeline,
         "player_stats": rows,
-        "charts": [],  # will be filled later (data URIs)
     }
 
 # =========================
-# Charts (optional)
+# Charts (JSON + optional png)
 # =========================
-def _fig_to_data_uri(fig) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-    buf.seek(0)
-    b64 = base64.b64encode(buf.read()).decode("utf-8")
-    return "data:image/png;base64," + b64
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
-def add_charts(stats: Dict[str, Any]) -> None:
-    if not (ENABLE_CHARTS and HAVE_MPL):
-        return
+def _save_fig_png(fig, save_path: Path) -> None:
+    _ensure_dir(save_path.parent)
+    fig.savefig(save_path, format="png", dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+def _chart_url(image_path: str) -> str:
+    # image_path is like "/reports/<matchId>/xxx.png"
+    if image_path.startswith("http://") or image_path.startswith("https://"):
+        return image_path
+    if not image_path.startswith("/"):
+        image_path = "/" + image_path
+    return PUBLIC_BASE_URL + image_path
+
+def build_charts(stats: Dict[str, Any], report_dir: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    charts = [{id,title,kind,imagePath?,data:{...}}]
+    report_dir があれば PNG を書き出して imagePath を入れる。
+    """
+    if not ENABLE_CHARTS:
+        return []
+    if not HAVE_MPL:
+        logger.warning("[CHARTS] matplotlib is not available (HAVE_MPL=False). charts will be empty.")
+        return []
 
     m = stats["match"]
+    match_id = (m.get("matchId") or "no_match_id").strip()
     home = m["home_team"]
     away = m["away_team"]
 
-    # 1) team category counts (total)
+    out: List[Dict[str, Any]] = []
+
+    # ---- helpers
     def sum_half(h: str, team: str, key: str) -> int:
         return int(stats["team_half_counts"][h][team].get(key, 0))
 
-    keys = ["goals", "shots", "fouls", "subs"]
-    labels = ["Goals", "Shots", "Fouls", "Subs"]
-
+    # 1) Team summary (total)
+    keys = ["goals", "shots", "fouls", "subs", "timeouts"]
+    labels = ["Goals", "Shots", "Fouls", "Subs", "Timeouts"]
     home_vals = [sum_half("first", home, k) + sum_half("second", home, k) for k in keys]
     away_vals = [sum_half("first", away, k) + sum_half("second", away, k) for k in keys]
 
-    fig = plt.figure()
-    x = list(range(len(labels)))
-    plt.bar([i - 0.2 for i in x], home_vals, width=0.4, label=home)
-    plt.bar([i + 0.2 for i in x], away_vals, width=0.4, label=away)
-    plt.xticks(x, labels)
-    plt.title("チーム比較（主要イベント数）")
-    plt.legend()
-    uri = _fig_to_data_uri(fig)
-    plt.close(fig)
-    stats["charts"].append({"title": "チーム比較（主要イベント数）", "data_uri": uri})
+    chart = {
+        "id": "team_summary",
+        "title": "チーム比較（主要イベント数）",
+        "kind": "bar_team_events",
+        "imagePath": None,
+        "data": {
+            "labels": labels,
+            "home": {"team": home, "values": home_vals},
+            "away": {"team": away, "values": away_vals},
+        }
+    }
 
-    # 2) top player shots (home/away)
+    if report_dir:
+        try:
+            fig = plt.figure(figsize=(10.5, 5.5))
+            x = list(range(len(labels)))
+            plt.bar([i - 0.2 for i in x], home_vals, width=0.4, label=home)
+            plt.bar([i + 0.2 for i in x], away_vals, width=0.4, label=away)
+            plt.xticks(x, labels)
+            plt.title("チーム比較（主要イベント数）")
+            plt.legend()
+            save_path = Path(report_dir) / match_id / "team_summary.png"
+            _save_fig_png(fig, save_path)
+            chart["imagePath"] = f"/reports/{match_id}/team_summary.png"
+        except Exception as e:
+            logger.exception("[CHARTS] failed to save team_summary png: %r", e)
+
+    out.append(chart)
+
+    # 2) Score timeline (step)
+    goals = stats.get("goals_timeline") or []
+    # build cumulative
+    def to_minsec(hb: str, minute: Optional[int], second: Optional[int]) -> int:
+        # timeline for charting: 1st 0-1200, 2nd 1200-2400, unknown 2400+
+        base = 0
+        if hb == "second":
+            base = 20 * 60
+        elif hb == "unknown":
+            base = 40 * 60
+        if minute is None or second is None:
+            return base
+        return base + int(minute) * 60 + int(second)
+
+    points = []
+    h_sc = 0
+    a_sc = 0
+    for g in goals:
+        t = to_minsec(g["half"], g.get("minute"), g.get("second"))
+        if g["team"] == home:
+            h_sc += 1
+        elif g["team"] == away:
+            a_sc += 1
+        points.append({"t": t, "home": h_sc, "away": a_sc, "team": g["team"]})
+
+    chart2 = {
+        "id": "score_timeline",
+        "title": "得点推移（累積）",
+        "kind": "step_score_timeline",
+        "imagePath": None,
+        "data": {
+            "homeTeam": home,
+            "awayTeam": away,
+            "points": points  # iOSでステップ線を描ける
+        }
+    }
+
+    if report_dir:
+        try:
+            fig = plt.figure(figsize=(10.5, 4.8))
+            if points:
+                xs = [p["t"] for p in points]
+                hs = [p["home"] for p in points]
+                as_ = [p["away"] for p in points]
+                plt.step(xs, hs, where="post", label=home)
+                plt.step(xs, as_, where="post", label=away)
+            plt.title("得点推移（累積）")
+            plt.xlabel("時間（前半0-20分 / 後半20-40分）")
+            plt.ylabel("得点（累積）")
+            plt.legend()
+            save_path = Path(report_dir) / match_id / "score_timeline.png"
+            _save_fig_png(fig, save_path)
+            chart2["imagePath"] = f"/reports/{match_id}/score_timeline.png"
+        except Exception as e:
+            logger.exception("[CHARTS] failed to save score_timeline png: %r", e)
+
+    out.append(chart2)
+
+    # 3) Top player shots per team
     def player_top(team: str, key: str, topk: int) -> Tuple[List[str], List[int]]:
-        rows = [r for r in stats["player_stats"] if r["team"] == team]
+        rows = [r for r in (stats.get("player_stats") or []) if r["team"] == team]
         rows.sort(key=lambda r: r.get(key, 0), reverse=True)
         rows = rows[:topk]
         return [r["player"] for r in rows], [int(r.get(key, 0)) for r in rows]
@@ -627,32 +724,39 @@ def add_charts(stats: Dict[str, Any]) -> None:
         names, vals = player_top(team, "shots", CHART_TOPK)
         if not names:
             continue
-        fig2 = plt.figure()
-        plt.bar(names, vals)
-        plt.xticks(rotation=45, ha="right")
-        plt.title(f"シュート数 上位{min(CHART_TOPK, len(names))}（{team}）")
-        plt.tight_layout()
-        uri2 = _fig_to_data_uri(fig2)
-        plt.close(fig2)
-        stats["charts"].append({"title": f"シュート数（{team}）", "data_uri": uri2})
+        cid = f"top_shots_{'home' if team==home else 'away'}"
+        c = {
+            "id": cid,
+            "title": f"シュート数 上位（{team}）",
+            "kind": "bar_player_top_shots",
+            "imagePath": None,
+            "data": {"team": team, "labels": names, "values": vals}
+        }
+        if report_dir:
+            try:
+                fig = plt.figure(figsize=(11.0, 5.2))
+                plt.bar(names, vals)
+                plt.xticks(rotation=30, ha="right")
+                plt.title(f"シュート数 上位{min(CHART_TOPK, len(names))}（{team}）")
+                plt.tight_layout()
+                save_path = Path(report_dir) / match_id / f"{cid}.png"
+                _save_fig_png(fig, save_path)
+                c["imagePath"] = f"/reports/{match_id}/{cid}.png"
+            except Exception as e:
+                logger.exception("[CHARTS] failed to save %s png: %r", cid, e)
+        out.append(c)
 
-def charts_markdown(stats: Dict[str, Any]) -> str:
-    charts = stats.get("charts") or []
-    if not charts:
-        return ""
-    md = ["\n\n## グラフ（自動生成）\n"]
-    for c in charts:
-        title = c.get("title", "")
-        uri = c.get("data_uri", "")
-        if uri:
-            md.append(f"### {title}\n\n![]({uri})\n")
-    return "\n".join(md)
+    return out
 
+# =========================
+# Markdown builders (tables + chart image links)
+# =========================
 def stats_tables_markdown(stats: Dict[str, Any]) -> str:
     m = stats["match"]
     home = m["home_team"]
     away = m["away_team"]
     sc = stats["score"]
+    hec = stats["half_event_counts"]
 
     lines = []
     lines.append("# 試合分析レポート\n")
@@ -662,14 +766,11 @@ def stats_tables_markdown(stats: Dict[str, Any]) -> str:
     lines.append(f"| {home} | {sc['first']['home']} | {sc['second']['home']} | {sc['total']['home']} |")
     lines.append(f"| {away} | {sc['first']['away']} | {sc['second']['away']} | {sc['total']['away']} |")
 
-    # half event counts
-    hec = stats["half_event_counts"]
     lines.append("\n## イベント件数（half判定のデバッグ用）\n")
     lines.append("| 前半 | 後半 | half不明 |")
     lines.append("|---:|---:|---:|")
     lines.append(f"| {hec['first']} | {hec['second']} | {hec['unknown']} |")
 
-    # player table (top 12)
     rows = stats.get("player_stats") or []
     if rows:
         top = rows[:12]
@@ -680,11 +781,22 @@ def stats_tables_markdown(stats: Dict[str, Any]) -> str:
             lines.append(
                 f"| {r['team']} | {r['player']} | {r['goals']} | {r['assists']} | {r['shots']} | {r['fouls']} | {r['sub_in']} | {r['sub_out']} |"
             )
-
     return "\n".join(lines) + "\n"
 
+def charts_markdown(charts: List[Dict[str, Any]]) -> str:
+    # png があるものだけ貼る（data URIは使わない）
+    items = [c for c in charts if c.get("imagePath")]
+    if not items:
+        return ""
+    md = ["\n\n## グラフ（自動生成）\n"]
+    for c in items:
+        title = c.get("title", "")
+        url = _chart_url(c["imagePath"])
+        md.append(f"### {title}\n\n![]({url})\n")
+    return "\n".join(md)
+
 # =========================
-# Build messages
+# Build messages (LLM input)
 # =========================
 def build_messages(
     match_payload: Dict[str, Any],
@@ -715,7 +827,6 @@ def build_messages(
 
     events = match_payload.get("events", []) or []
 
-    # half 正規化して分類
     first_half: List[Dict[str, Any]] = []
     second_half: List[Dict[str, Any]] = []
     unknown_half: List[Dict[str, Any]] = []
@@ -729,7 +840,6 @@ def build_messages(
         else:
             unknown_half.append(ev)
 
-    # snapshot 数（送れる候補）
     snapshot_candidates = [ev for ev in events if should_attach_snapshot(ev)]
     logger.info(
         "[PAYLOAD] events=%d (1st=%d, 2nd=%d, unknown=%d) snapshots=%d venue=%s",
@@ -749,14 +859,12 @@ def build_messages(
     )
     user_content.append({"type": "input_text", "text": intro_text})
 
-    # ✅ STATS_JSON を注入（ここが事実の唯一ソース）
     stats_text = json.dumps(stats_json, ensure_ascii=False, indent=2)
     user_content.append({
         "type": "input_text",
         "text": "【STATS_JSON（重要：この中が事実。スコア/得点/集計は改変・再計算禁止）】\n```json\n" + stats_text + "\n```\n"
     })
 
-    # RAG を user に注入
     rag_text_lines = []
     for kid, score, ktext in rag_hits:
         rag_text_lines.append(f"{kid} score={score:.3f} text={ktext}")
@@ -765,7 +873,6 @@ def build_messages(
         "text": "【参考知識（RAG）】\n" + "\n".join(rag_text_lines) + "\n"
     })
 
-    # 画像の送信数を絞る（優先度順）
     chosen_images: List[Dict[str, Any]] = []
     if allow_images and snapshot_candidates:
         snapshot_candidates.sort(key=event_priority, reverse=True)
@@ -779,7 +886,6 @@ def build_messages(
             else:
                 logger.info("[SNAPSHOT_SKIP] not reachable url=%s", url)
 
-    # 前半
     if first_half:
         user_content.append({"type": "input_text", "text": "\n--- 前半 (1st) ---\n"})
         for i, ev in enumerate(first_half, start=1):
@@ -791,7 +897,6 @@ def build_messages(
                     if any(x["url"] == url for x in chosen_images):
                         user_content.append({"type": "input_image", "image_url": url})
 
-    # 後半
     if second_half:
         user_content.append({"type": "input_text", "text": "\n--- 後半 (2nd) ---\n"})
         for i, ev in enumerate(second_half, start=1):
@@ -805,7 +910,6 @@ def build_messages(
     else:
         user_content.append({"type": "input_text", "text": "\n【後半イベント】未提供（2ndは0件）。後半について推測で書かないでください。\n"})
 
-    # half不明
     if unknown_half:
         user_content.append({"type": "input_text", "text": "\n--- half不明 (unknown) ---\n"})
         user_content.append({"type": "input_text", "text": "※ これらは前半/後半が不明です。後半扱いにせず『half不明（要修正）』として扱ってください。\n"})
@@ -830,7 +934,7 @@ def build_messages(
             "content": user_content,
         },
     ]
-    logger.info("[SEND] messages=%d allow_images=%s chosen_images=%d", len(messages), allow_images, len(chosen_images))
+    logger.info("[SEND] allow_images=%s chosen_images=%d", allow_images, len(chosen_images))
     return messages
 
 # =========================
@@ -847,7 +951,6 @@ def extract_rag_used_ids(text: str) -> List[str]:
     inside = m.group(1).strip()
     if inside.lower() in ("none", "ids=none") or inside == "":
         return []
-    # allow "KB001,KB002" or "KB001 KB002"
     inside = inside.replace("\n", " ").replace(" ", ",")
     ids = [x.strip() for x in inside.split(",") if x.strip()]
     return [x for x in ids if re.fullmatch(r"KB\d{3}", x)]
@@ -868,18 +971,40 @@ def strip_rag_used_footer(text: str) -> str:
     return strip_tag_block(text, "rag_used")
 
 # =========================
+# OpenAI call helper (temperature fallback)
+# =========================
+def _responses_create_with_fallback(model: str, input_messages: List[Dict[str, Any]], temperature: float) -> str:
+    kwargs: Dict[str, Any] = {"model": model, "input": input_messages}
+
+    # まず温度ありで試す
+    kwargs["temperature"] = temperature
+    try:
+        resp = client.responses.create(**kwargs)
+        return resp.output_text or ""
+    except BadRequestError as e:
+        msg = str(e)
+        # temperature 非対応モデル（例: o-series）対策
+        if "Unsupported parameter" in msg and "temperature" in msg:
+            logger.warning("[OPENAI] temperature unsupported for model=%s -> retry without temperature", model)
+            kwargs.pop("temperature", None)
+            resp2 = client.responses.create(**kwargs)
+            return resp2.output_text or ""
+        raise
+
+# =========================
 # Main API function
 # =========================
-def generate_match_report_bundle(match_payload: Dict[str, Any]) -> Dict[str, Any]:
+def generate_match_report_bundle(match_payload: Dict[str, Any], report_dir: Optional[str] = None) -> Dict[str, Any]:
     """
-    監督/選手向けの Markdown + 表 + (任意)グラフ を返す bundle.
-    FastAPI 側で JSON として返したい場合はこちらを使う。
+    監督/選手向けの Markdown + stats(JSON) + charts(JSON+optional png) を返す bundle.
     """
     t0 = time.time()
 
     # ===== build stats first (facts) =====
     stats = build_stats(match_payload)
-    add_charts(stats)
+
+    # ===== build charts (json + optional png) =====
+    charts = build_charts(stats, report_dir=report_dir)
 
     # ===== RAG query =====
     venue = match_payload.get("venue") or ""
@@ -900,32 +1025,21 @@ def generate_match_report_bundle(match_payload: Dict[str, Any]) -> Dict[str, Any
 
     rag_hits = rag_search(rag_query, top_k=RAG_TOP_K)
     logger.info("[RAG] top=%d", len(rag_hits))
-    for kid, score, ktext in rag_hits:
-        logger.info("[RAG] %s score=%.3f text=%s", kid, score, (ktext[:90] + "…") if len(ktext) > 90 else ktext)
 
     # 1st try: allow images
     messages = build_messages(match_payload, rag_hits, stats_json=stats, allow_images=True)
 
     try:
-        resp = client.responses.create(
-            model=REPORT_MODEL,
-            input=messages,
-            temperature=REPORT_TEMPERATURE,
-        )
-        out = resp.output_text or ""
+        out = _responses_create_with_fallback(REPORT_MODEL, messages, REPORT_TEMPERATURE)
     except BadRequestError as e:
         msg = str(e)
+        # 画像URLダウンロード失敗の典型
         if "Timeout while downloading" in msg or ("param" in msg and "url" in msg):
             logger.warning("[OPENAI] image download failed -> retry without images: %s", msg)
             messages2 = build_messages(match_payload, rag_hits, stats_json=stats, allow_images=False)
-            resp2 = client.responses.create(
-                model=REPORT_MODEL,
-                input=messages2,
-                temperature=REPORT_TEMPERATURE,
-            )
-            out = resp2.output_text or ""
+            out = _responses_create_with_fallback(REPORT_MODEL, messages2, REPORT_TEMPERATURE)
         else:
-            logger.exception("[OPENAI] BadRequestError (not image-url): %s", msg)
+            logger.exception("[OPENAI] BadRequestError: %s", msg)
             raise
 
     tail = (out or "")[-300:].replace("\n", "\\n")
@@ -935,18 +1049,12 @@ def generate_match_report_bundle(match_payload: Dict[str, Any]) -> Dict[str, Any
     logger.info("[RESULT] length=%d sec=%.2f", len(out), time.time() - t0)
     logger.info("[RAG-USED] ids=%s", ",".join(used_ids) if used_ids else "none")
 
-    used_set = set(used_ids)
-    for item in KB_ITEMS:
-        if item["id"] in used_set:
-            logger.info("[RAG-USED] %s text=%s", item["id"], (item["text"][:120] + "…") if len(item["text"]) > 120 else item["text"])
-
-    # ===== extract markdown report =====
     report_md = extract_report_md(out)
-    report_md = strip_rag_used_footer(report_md)  # in case tags leaked into the block
+    report_md = strip_rag_used_footer(report_md)
 
-    # ===== prepend tables + append charts =====
+    # ===== assemble markdown =====
     header_md = stats_tables_markdown(stats)
-    chart_md = charts_markdown(stats)
+    chart_md = charts_markdown(charts)
 
     full_md = header_md + "\n" + report_md + "\n" + chart_md
 
@@ -954,12 +1062,10 @@ def generate_match_report_bundle(match_payload: Dict[str, Any]) -> Dict[str, Any
         "report_md": full_md,
         "rag_used_ids": used_ids,
         "stats": stats,
-        "has_charts": bool(stats.get("charts")),
+        "charts": charts,
+        "has_charts": any(c.get("imagePath") for c in charts) or bool(charts),
     }
 
 def generate_match_report(match_payload: Dict[str, Any]) -> str:
-    """
-    互換: 文字列だけ返す（従来の FastAPI の返しが str の場合はこれを使う）
-    """
-    bundle = generate_match_report_bundle(match_payload)
+    bundle = generate_match_report_bundle(match_payload, report_dir=None)
     return bundle["report_md"]
