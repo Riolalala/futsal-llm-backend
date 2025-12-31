@@ -1,22 +1,20 @@
+# main.py
 import asyncio
-import os
 import logging
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from report_generator import generate_match_report
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pathlib import Path
 
-# ログ設定
+from report_generator import generate_match_report_bundle
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# ==== Swift側の LLMPayload に対応する Pydantic モデル ====
 
 class LLMPlayer(BaseModel):
     number: int
@@ -49,21 +47,31 @@ class LLMPayload(BaseModel):
     away: LLMTeamInfo
     events: List[LLMEvent]
 
-class ReportResponse(BaseModel):
-    report: str
+class ReportChart(BaseModel):
+    id: str
+    title: str
+    kind: str
+    imagePath: Optional[str] = None
+    data: Dict[str, Any]
 
-# ==== FastAPI アプリ ====
+class ReportResponse(BaseModel):
+    reportMd: str
+    ragUsedIds: List[str]
+    stats: Dict[str, Any]
+    charts: List[ReportChart]
+    hasCharts: bool
 
 app = FastAPI()
 
-# スナップショット保存ディレクトリ
-SNAPSHOT_DIR = Path(__file__).resolve().parent / "snapshots"
+BASE_DIR = Path(__file__).resolve().parent
+SNAPSHOT_DIR = BASE_DIR / "snapshots"
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ★これがないと /snapshots/... が404になりやすい
-app.mount("/snapshots", StaticFiles(directory=str(SNAPSHOT_DIR)), name="snapshots")
+REPORT_DIR = BASE_DIR / "reports"
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ========== 画像アップロード用エンドポイント ==========
+app.mount("/snapshots", StaticFiles(directory=str(SNAPSHOT_DIR)), name="snapshots")
+app.mount("/reports", StaticFiles(directory=str(REPORT_DIR)), name="reports")
 
 @app.post("/upload_snapshot")
 async def upload_snapshot(
@@ -71,33 +79,24 @@ async def upload_snapshot(
     eventId: str = Form(...),
     file: UploadFile = File(...),
 ):
-    """
-    iOS から送られてきた戦術ボード画像を保存し、
-    クライアントが使う snapshotPath（相対パス）を返す。
-    """
     logger.debug(
         "upload_snapshot: matchId=%s, eventId=%s, filename=%s content_type=%s",
         matchId, eventId, file.filename, file.content_type,
     )
 
-    # 保存先ディレクトリ: snapshots/<matchId>/
     match_dir = SNAPSHOT_DIR / matchId
     match_dir.mkdir(parents=True, exist_ok=True)
 
-    # 拡張子は一旦 .png に固定（必要なら file.filename から推定してもOK）
     filename = f"{eventId}.png"
     save_path = match_dir / filename
 
     content = await file.read()
     save_path.write_bytes(content)
 
-    # クライアントに返す snapshotPath（LLMPayload.events[].snapshotPath に入れる）
     snapshot_path = f"/snapshots/{matchId}/{filename}"
     logger.debug("saved snapshot to %s (bytes=%d), snapshotPath=%s", save_path, len(content), snapshot_path)
 
     return JSONResponse({"snapshotPath": snapshot_path})
-
-# ========== 試合レポート生成エンドポイント ==========
 
 @app.post("/generate_report", response_model=ReportResponse)
 async def generate_report_endpoint(payload: LLMPayload):
@@ -111,11 +110,20 @@ async def generate_report_endpoint(payload: LLMPayload):
         logger.info("[PAYLOAD] events=%d with_snapshotPath=%d venue=%s",
                     len(evs), with_sp, match_dict.get("venue"))
 
-        # ✅ ここが重要：同期の重い処理をイベントループ上で回さない
-        report = await asyncio.to_thread(generate_match_report, match_dict)
+        bundle = await asyncio.to_thread(
+            generate_match_report_bundle,
+            match_dict,
+            str(REPORT_DIR),
+        )
 
-        logger.debug("report generated successfully, length=%d", len(report))
-        return ReportResponse(report=report)
+        charts = bundle.get("charts", []) or []
+        return ReportResponse(
+            reportMd=bundle["report_md"],
+            ragUsedIds=bundle.get("rag_used_ids", []),
+            stats=bundle["stats"],
+            charts=charts,
+            hasCharts=bool(charts),
+        )
 
     except Exception as e:
         logger.exception("エラーが発生しました: %s", e)
