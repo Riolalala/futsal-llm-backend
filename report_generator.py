@@ -732,8 +732,8 @@ def build_charts(stats: Dict[str, Any], report_dir: Optional[str]) -> List[Dict[
 
     # 4) NEW: shots per minute (line)  ※iOSでLineMark
     events = stats.get("misc_timeline") or []
-    series = []  # [{team, t, value}]
-    # bins: 0..20 for each half -> map to absolute seconds like earlier (0-1200, 1200-2400)
+    series = []  # [{team, minute, shots}]
+
     def add_shot(team: str, hb: str, minute: Optional[int]) -> int:
         if minute is None:
             return -1
@@ -744,7 +744,6 @@ def build_charts(stats: Dict[str, Any], report_dir: Optional[str]) -> List[Dict[
             base = 40
         return base + int(minute)
 
-    # count per team per absolute minute
     cnt: Dict[Tuple[str, int], int] = defaultdict(int)
     for ev in events:
         if not _is_shot(ev.get("type") or ""):
@@ -756,7 +755,6 @@ def build_charts(stats: Dict[str, Any], report_dir: Optional[str]) -> List[Dict[
         if tmin >= 0:
             cnt[(team, tmin)] += 1
 
-    # build points 0..40
     for team in (home, away):
         for tmin in range(0, 41):
             series.append({"team": team, "minute": tmin, "shots": int(cnt.get((team, tmin), 0))})
@@ -774,7 +772,6 @@ def build_charts(stats: Dict[str, Any], report_dir: Optional[str]) -> List[Dict[
     })
 
     # 5) NEW: event share (pie) ※iOSでSectorMark
-    # total across both halves (home+away)
     def total(team: str, key: str) -> int:
         return (sum_half("first", team, key) + sum_half("second", team, key))
 
@@ -800,41 +797,31 @@ def build_charts(stats: Dict[str, Any], report_dir: Optional[str]) -> List[Dict[
     return out
 
 # =========================
-# Markdown builders (tables + chart image links)
+# Markdown builders (tables)
 # =========================
 def stats_tables_markdown(stats: Dict[str, Any]) -> str:
+    """
+    ✅ 本文に不要な段落（イベント件数/個人指標など）を出さない版。
+    ここではスコア表だけ出す。
+    """
     m = stats["match"]
     home = m["home_team"]
     away = m["away_team"]
     sc = stats["score"]
-    hec = stats["half_event_counts"]
 
-    lines = []
+    lines: List[str] = []
     lines.append("# 試合分析レポート\n")
     lines.append("## スコア（集計はコード確定）\n")
     lines.append("| | 前半 | 後半 | 合計 |")
     lines.append("|---|---:|---:|---:|")
     lines.append(f"| {home} | {sc['first']['home']} | {sc['second']['home']} | {sc['total']['home']} |")
     lines.append(f"| {away} | {sc['first']['away']} | {sc['second']['away']} | {sc['total']['away']} |")
-
-    lines.append("\n## イベント件数（half判定のデバッグ用）\n")
-    lines.append("| 前半 | 後半 | half不明 |")
-    lines.append("|---:|---:|---:|")
-    lines.append(f"| {hec['first']} | {hec['second']} | {hec['unknown']} |")
-
-    rows = stats.get("player_stats") or []
-    if rows:
-        top = rows[:12]
-        lines.append("\n## 個人指標（上位）\n")
-        lines.append("| チーム | 選手 | 得点 | A | シュート | ファウル | IN | OUT |")
-        lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
-        for r in top:
-            lines.append(
-                f"| {r['team']} | {r['player']} | {r['goals']} | {r['assists']} | {r['shots']} | {r['fouls']} | {r['sub_in']} | {r['sub_out']} |"
-            )
     return "\n".join(lines) + "\n"
 
 def charts_markdown(charts: List[Dict[str, Any]]) -> str:
+    """
+    ⚠️ 互換のため関数は残すが、本文(full_md)には連結しない。
+    """
     items = [c for c in charts if c.get("imagePath")]
     if not items:
         return ""
@@ -1012,6 +999,25 @@ def extract_report_md(text: str) -> str:
 def strip_rag_used_footer(text: str) -> str:
     return strip_tag_block(text, "rag_used")
 
+# ✅ 保険：LLMが本文に「グラフ/チャート…」段落を混ぜても強制削除
+_GRAPH_SECTION_RE = re.compile(
+    r"""
+    (?:\n|^)                 # 行頭
+    \#{2,3}\s*               # ## または ###
+    .*?(グラフ|チャート|可視化|自動生成|プロット|図表|表示|画面).*
+    \n
+    (.*?)(?=\n\#{2}\s|\Z)    # 次の "## " または EOF まで削除
+    """,
+    re.IGNORECASE | re.DOTALL | re.VERBOSE
+)
+
+def strip_graph_sections(md: str) -> str:
+    if not md:
+        return ""
+    out = re.sub(_GRAPH_SECTION_RE, "\n", md)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
 # =========================
 # OpenAI call helper (temperature fallback)
 # =========================
@@ -1082,15 +1088,19 @@ def generate_match_report_bundle(match_payload: Dict[str, Any], report_dir: Opti
     report_md = extract_report_md(out)
     report_md = strip_rag_used_footer(report_md)
 
+    # ✅ 念のため：本文内に「グラフ/チャート…」段落があれば削除
+    report_md = strip_graph_sections(report_md)
+
     header_md = stats_tables_markdown(stats)
-    chart_md = charts_markdown(charts)
-    full_md = header_md + "\n" + report_md + "\n" + chart_md
+
+    # ✅ 重要：グラフは別画面で表示するので本文に混ぜない
+    full_md = header_md + "\n" + report_md
 
     return {
         "report_md": full_md,
         "rag_used_ids": used_ids,
         "stats": stats,
-        "charts": charts,
+        "charts": charts,          # ← グラフ用データは返す
         "has_charts": bool(charts),
     }
 
