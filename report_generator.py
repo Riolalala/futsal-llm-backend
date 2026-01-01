@@ -42,7 +42,7 @@ SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 REPORT_MODEL = os.getenv("REPORT_MODEL", "gpt-4o")
-REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "0"))
+REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "1"))
 
 SNAPSHOT_CHECK_TIMEOUT = float(os.getenv("SNAPSHOT_CHECK_TIMEOUT", "3.0"))
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "24"))
