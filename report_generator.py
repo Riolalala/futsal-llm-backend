@@ -42,12 +42,26 @@ SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 REPORT_MODEL = os.getenv("REPORT_MODEL", "gpt-4o")
-REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "1"))
+
+# ✅ 評価用: 既定を 0 に（環境変数で上書き可能）
+REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "0"))
 
 SNAPSHOT_CHECK_TIMEOUT = float(os.getenv("SNAPSHOT_CHECK_TIMEOUT", "3.0"))
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "24"))
 
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
+
+# =========================
+# Evaluation condition (C0/C1/C2)
+# =========================
+# ✅ コメントアウトで切り替え（評価時に使う条件だけ残す）
+REPORT_CONDITION = "C2"
+# REPORT_CONDITION = "C1"
+# REPORT_CONDITION = "C0"
+#
+# C0：RAGなし／簡易プロンプト（ベースライン）
+# C1：RAGなし／プロンプト改善のみ
+# C2：RAGあり＋プロンプト改善（提案法）
 
 # charts
 ENABLE_CHARTS = os.getenv("ENABLE_CHARTS", "1").lower() not in ("0", "false", "no")
@@ -60,6 +74,7 @@ SKIP_SNAPSHOT_TYPES = {
 
 logger.info("[CHARTS] ENABLE_CHARTS=%s HAVE_MPL=%s", ENABLE_CHARTS, HAVE_MPL)
 logger.info("[MODEL] REPORT_MODEL=%s REPORT_TEMPERATURE=%s", REPORT_MODEL, REPORT_TEMPERATURE)
+logger.info("[COND] REPORT_CONDITION=%s", REPORT_CONDITION)
 
 # =========================
 # Import prompt / knowledge
@@ -839,7 +854,9 @@ def build_messages(
     match_payload: Dict[str, Any],
     rag_hits: List[Tuple[str, float, str]],
     stats_json: Dict[str, Any],
-    allow_images: bool = True
+    allow_images: bool = True,
+    include_rag: bool = True,                     # ✅ 追加：RAGブロックを入れるか
+    system_prompt_override: Optional[str] = None  # ✅ 追加：C0用にsystem promptを差し替え
 ) -> List[Dict[str, Any]]:
     venue = match_payload.get("venue") or "会場不明"
     tournament = match_payload.get("tournament") or "大会名不明"
@@ -902,13 +919,15 @@ def build_messages(
         "text": "【STATS_JSON（重要：この中が事実。スコア/得点/集計は改変・再計算禁止）】\n```json\n" + stats_text + "\n```\n"
     })
 
-    rag_text_lines = []
-    for kid, score, ktext in rag_hits:
-        rag_text_lines.append(f"{kid} score={score:.3f} text={ktext}")
-    user_content.append({
-        "type": "input_text",
-        "text": "【参考知識（RAG）】\n" + "\n".join(rag_text_lines) + "\n"
-    })
+    # ✅ C2のみRAGブロックを投入（C0/C1は完全に入れない）
+    if include_rag and rag_hits:
+        rag_text_lines = []
+        for kid, score, ktext in rag_hits:
+            rag_text_lines.append(f"{kid} score={score:.3f} text={ktext}")
+        user_content.append({
+            "type": "input_text",
+            "text": "【参考知識（RAG）】\n" + "\n".join(rag_text_lines) + "\n"
+        })
 
     chosen_images: List[Dict[str, Any]] = []
     if allow_images and snapshot_candidates:
@@ -959,11 +978,13 @@ def build_messages(
                     if any(x["url"] == url for x in chosen_images):
                         user_content.append({"type": "input_image", "image_url": url})
 
+    sys_prompt = (system_prompt_override or SYSTEM_PROMPT)
+
     messages = [
-        {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
+        {"role": "system", "content": [{"type": "input_text", "text": sys_prompt}]},
         {"role": "user", "content": user_content},
     ]
-    logger.info("[SEND] allow_images=%s chosen_images=%d", allow_images, len(chosen_images))
+    logger.info("[SEND] allow_images=%s chosen_images=%d include_rag=%s", allow_images, len(chosen_images), include_rag)
     return messages
 
 # =========================
@@ -1056,15 +1077,41 @@ def generate_match_report_bundle(match_payload: Dict[str, Any], report_dir: Opti
     home_map = _roster_map(home)
     away_map = _roster_map(away)
 
+    # ===== condition switch =====
+    cond = (REPORT_CONDITION or "C2").strip().upper()
+    use_rag = (cond == "C2")            # ✅ C2のみRAGあり
+    use_simple_prompt = (cond == "C0")  # ✅ C0のみ簡易プロンプト（system差替え）
+
+    # RAG query（C2のときだけ使う）
     sample_events_text = "\n".join(
         _build_event_text(ev, home_name, away_name, home_map, away_map) for ev in events[:30]
     )
     rag_query = f"{tournament} {venue}\n{sample_events_text}\n戦術 フォーメーション セットプレイ 守備 攻撃"
 
-    rag_hits = rag_search(rag_query, top_k=RAG_TOP_K)
-    logger.info("[RAG] top=%d", len(rag_hits))
+    rag_hits: List[Tuple[str, float, str]] = []
+    if use_rag:
+        rag_hits = rag_search(rag_query, top_k=RAG_TOP_K)
+        logger.info("[RAG] cond=%s top=%d", cond, len(rag_hits))
+    else:
+        logger.info("[RAG] cond=%s disabled", cond)
 
-    messages = build_messages(match_payload, rag_hits, stats_json=stats, allow_images=True)
+    # system prompt の切替（C0だけ簡易）
+    system_prompt_for_run = SYSTEM_PROMPT
+    if use_simple_prompt:
+        system_prompt_for_run = (
+            "あなたはフットサルの試合レポートを書くアシスタントです。\n"
+            "入力の STATS_JSON を最優先の根拠として、事実を改変せずに簡潔にまとめてください。\n"
+            "推測や未記録の作り話はしないでください。\n"
+        ) + OUTPUT_FORMAT_APPEND + ("\n" + SYSTEM_PROMPT_SAFE_APPEND if SYSTEM_PROMPT_SAFE_APPEND else "")
+
+    messages = build_messages(
+        match_payload,
+        rag_hits,
+        stats_json=stats,
+        allow_images=True,
+        include_rag=use_rag,
+        system_prompt_override=system_prompt_for_run
+    )
 
     try:
         out = _responses_create_with_fallback(REPORT_MODEL, messages, REPORT_TEMPERATURE)
@@ -1072,7 +1119,14 @@ def generate_match_report_bundle(match_payload: Dict[str, Any], report_dir: Opti
         msg = str(e)
         if "Timeout while downloading" in msg or ("param" in msg and "url" in msg):
             logger.warning("[OPENAI] image download failed -> retry without images: %s", msg)
-            messages2 = build_messages(match_payload, rag_hits, stats_json=stats, allow_images=False)
+            messages2 = build_messages(
+                match_payload,
+                rag_hits,
+                stats_json=stats,
+                allow_images=False,
+                include_rag=use_rag,
+                system_prompt_override=system_prompt_for_run
+            )
             out = _responses_create_with_fallback(REPORT_MODEL, messages2, REPORT_TEMPERATURE)
         else:
             logger.exception("[OPENAI] BadRequestError: %s", msg)
@@ -1082,7 +1136,7 @@ def generate_match_report_bundle(match_payload: Dict[str, Any], report_dir: Opti
     logger.info("[RAW_TAIL] %s", tail)
 
     used_ids = extract_rag_used_ids(out)
-    logger.info("[RESULT] length=%d sec=%.2f", len(out), time.time() - t0)
+    logger.info("[RESULT] cond=%s length=%d sec=%.2f", cond, len(out), time.time() - t0)
     logger.info("[RAG-USED] ids=%s", ",".join(used_ids) if used_ids else "none")
 
     report_md = extract_report_md(out)
@@ -1097,6 +1151,8 @@ def generate_match_report_bundle(match_payload: Dict[str, Any], report_dir: Opti
     full_md = header_md + "\n" + report_md
 
     return {
+        "condition": cond,          # ✅ 評価で便利（C0/C1/C2）
+        "temperature": REPORT_TEMPERATURE,
         "report_md": full_md,
         "rag_used_ids": used_ids,
         "stats": stats,
