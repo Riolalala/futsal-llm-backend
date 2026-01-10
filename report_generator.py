@@ -35,7 +35,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("report_generator")
 
-client = OpenAI()
+OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "180"))  # 例: 180秒
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
+
+client = OpenAI(
+    timeout=httpx.Timeout(
+        connect=10.0,
+        read=OPENAI_TIMEOUT_SEC,
+        write=OPENAI_TIMEOUT_SEC,
+        pool=OPENAI_TIMEOUT_SEC,
+    ),
+    max_retries=OPENAI_MAX_RETRIES,
+)
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://futsal-report-api.onrender.com").rstrip("/")
 SNAPSHOT_BASE_URL = os.getenv("SNAPSHOT_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
