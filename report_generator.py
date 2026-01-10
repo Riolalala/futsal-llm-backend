@@ -67,8 +67,8 @@ RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
 # =========================
 # ✅ コメントアウトで切り替え（評価時に使う条件だけ残す）
 # REPORT_CONDITION = "C2"
-REPORT_CONDITION = "C1"
-# REPORT_CONDITION = "C0"
+# REPORT_CONDITION = "C1"
+REPORT_CONDITION = "C0"
 #
 # C0：RAGなし／簡易プロンプト（ベースライン）
 # C1：RAGなし／プロンプト改善のみ
