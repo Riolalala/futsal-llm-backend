@@ -55,7 +55,7 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 REPORT_MODEL = os.getenv("REPORT_MODEL", "gpt-4o")
 
 # ✅ 評価用: 既定を 0 に（環境変数で上書き可能）
-REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "0"))
+REPORT_TEMPERATURE = float(os.getenv("REPORT_TEMPERATURE", "1"))
 
 SNAPSHOT_CHECK_TIMEOUT = float(os.getenv("SNAPSHOT_CHECK_TIMEOUT", "3.0"))
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "24"))
